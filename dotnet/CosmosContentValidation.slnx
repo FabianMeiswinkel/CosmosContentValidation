@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="src/CosmosContentValidation/CosmosContentValidation.csproj" />
+  <Project Path="samples/CosmosContentValidation.Sample/CosmosContentValidation.Sample.csproj" />
+  <Project Path="tests/CosmosContentValidation.Tests/CosmosContentValidation.Tests.csproj" />
+  <Project Path="tests/CosmosContentValidation.LiveTests/CosmosContentValidation.LiveTests.csproj" />
+</Solution>

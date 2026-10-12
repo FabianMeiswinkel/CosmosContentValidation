@@ -1,0 +1,41 @@
+name: .NET PR1
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      COSMOS_RUN_LIVE_TESTS: '0'
+      COSMOS_DISABLE_IMDS_ACCESS: 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Restore
+        run: dotnet restore dotnet/CosmosContentValidation.slnx --source https://api.nuget.org/v3/index.json
+      - name: Build
+        run: dotnet build dotnet/CosmosContentValidation.slnx -c Release --no-restore
+      - name: Offline tests (live tests disabled)
+        run: dotnet test dotnet/CosmosContentValidation.slnx -c Release --no-build --logger "trx;LogFilePrefix=pr1"
+      - name: Offline console demonstration
+        run: dotnet run --project dotnet/samples/CosmosContentValidation.Sample -c Release --no-build -- --offline
+      - name: Package reusable library
+        run: dotnet pack dotnet/src/CosmosContentValidation -c Release --no-build --output artifacts/packages
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr1-${{ matrix.os }}
+          path: |
+            dotnet/tests/**/TestResults/*.trx
+            artifacts/packages/*

@@ -55,3 +55,15 @@ CodeCoverage/
 *.VisualState.xml
 TestResult.xml
 nunit-*.xml
+
+# Local credentials and signing material (public test fixtures are JSON)
+.secrets/
+*.pem
+*.pfx
+*.p12
+.env.*
+
+# Java and local IDE output
+target/
+.idea/
+.vs/

@@ -1,0 +1,28 @@
+{
+  "name": "default-policy",
+  "provenance": "Manually specified JCS bytes; independently SHA256-hashed and prehash-signed with platform ECDsa. Ephemeral private key discarded; public verification fixture only.",
+  "numericModel": "Finite IEEE binary64; integral magnitude <= 9007199254740991; nonzero underflow rejected; exact decimals and large integers must be strings.",
+  "additionalIgnoredRootProperties": [],
+  "partitionKeyPaths": ["/pk"],
+  "policyCanonical": "{\"ignoredProperties\":[\"_attachments\",\"_etag\",\"_rid\",\"_self\",\"_ts\"],\"scope\":\"root\",\"version\":1}",
+  "exclusionPolicyHash": "PyDqvHP6AV2VoZ_P2S24Yx6iIroH5OJ2ENwpkOFuk_0",
+  "document": {
+    "id": "fixture-1", "pk": "tenant-a", "message": "café 🚀", "count": 42, "amount": 4.50,
+    "items": [null, true, {"z": "end", "a": 1}], "_etag": "server-etag", "ttl": 60
+  },
+  "canonicalDocument": "{\"amount\":4.5,\"count\":42,\"id\":\"fixture-1\",\"items\":[null,true,{\"a\":1,\"z\":\"end\"}],\"message\":\"café 🚀\",\"pk\":\"tenant-a\",\"ttl\":60}",
+  "canonicalHeader": "{\"canonicalization\":\"rfc8785-binary64-v1\",\"exclusionPolicyHash\":\"PyDqvHP6AV2VoZ_P2S24Yx6iIroH5OJ2ENwpkOFuk_0\",\"hashAlgorithm\":\"SHA-256\",\"kid\":\"fixture-2026\",\"signatureAlgorithm\":\"ECDSA-P256-SHA256-P1363\",\"v\":1}",
+  "canonicalSignedContent": "{\"document\":{\"amount\":4.5,\"count\":42,\"id\":\"fixture-1\",\"items\":[null,true,{\"a\":1,\"z\":\"end\"}],\"message\":\"café 🚀\",\"pk\":\"tenant-a\",\"ttl\":60},\"domain\":\"CosmosContentValidation\",\"header\":{\"canonicalization\":\"rfc8785-binary64-v1\",\"exclusionPolicyHash\":\"PyDqvHP6AV2VoZ_P2S24Yx6iIroH5OJ2ENwpkOFuk_0\",\"hashAlgorithm\":\"SHA-256\",\"kid\":\"fixture-2026\",\"signatureAlgorithm\":\"ECDSA-P256-SHA256-P1363\",\"v\":1}}",
+  "sha256Base64Url": "0Oi0uoDze3uNrz7kqrVegW65HxxfjLo-HP7WzLiKoR4",
+  "publicKeyPem": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAENapbTwkrRg6IvLqqShkgGiECM48B\n3CicQs0RN/HQMt1gv0b1iusWw2/qcFfU9enST/Iwn/8LFI9KRvHYSYOrjA==\n-----END PUBLIC KEY-----",
+  "signedDocument": {
+    "id": "fixture-1", "pk": "tenant-a", "message": "café 🚀", "count": 42, "amount": 4.5,
+    "items": [null, true, {"z": "end", "a": 1}], "_etag": "server-etag", "ttl": 60,
+    "_contentValidation": {
+      "canonicalization": "rfc8785-binary64-v1",
+      "exclusionPolicyHash": "PyDqvHP6AV2VoZ_P2S24Yx6iIroH5OJ2ENwpkOFuk_0",
+      "hashAlgorithm": "SHA-256", "kid": "fixture-2026", "signatureAlgorithm": "ECDSA-P256-SHA256-P1363", "v": 1,
+      "signature": "g_0DVVNydXh0B5U3QLVDn38KolGRB3fOKhruLpCDsN7uhsvF5MTLGjuaHfpnnoMW7SHdzoe7sjLD2g8uCQVTAw"
+    }
+  }
+}
