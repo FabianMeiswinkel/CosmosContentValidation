@@ -70,7 +70,9 @@ public sealed class ContentValidationSerializer : CosmosSerializer
 
     private T Materialize<T>(RecyclableMemoryStream source)
     {
-        using RecyclableMemoryStream verified = processor.ValidateAndStrip(source.GetReadOnlySequence(), allowArray: typeof(T).IsArray);
+        using RecyclableMemoryStream verified = typeof(T).IsArray
+            ? processor.ValidateFeedAndStrip(source.GetReadOnlySequence())
+            : processor.ValidateAndStrip(source.GetReadOnlySequence());
         // A delegate owns FromStream's argument; give it a non-owning view so the pooled owner
         // is returned exactly once, even when the delegate throws or forgets to dispose its view.
         return inner.FromStream<T>(new BorrowedReadStream(verified));

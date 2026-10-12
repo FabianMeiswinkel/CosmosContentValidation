@@ -221,7 +221,7 @@ covers explicit constructor dependencies, required whole-input validation and de
 [SerializerTests](../dotnet/tests/CosmosContentValidation.Tests/SerializerTests.cs), [SerializerDisposalTests](../dotnet/tests/CosmosContentValidation.Tests/SerializerDisposalTests.cs)
 and [BufferPoolTests](../dotnet/tests/CosmosContentValidation.Tests/BufferPoolTests.cs) cover pre-mapping validation, replay, offsets, cancellation and ownership.
 See [latest recorded PR2 validation evidence](pr2-validation.md) for executed build, offline test, demo and packaging checks.
-Current PR2 offline verification is recorded in [pr2-validation.md](pr2-validation.md). Live Azure execution remains pending.
+Current PR2 offline and 30-row Direct/Gateway live verification is recorded in [pr2-validation.md](pr2-validation.md).
 The future security team owns validation and replacement of all concrete providers and their dependencies. User review must approve public interfaces,
 all guarded SDK entry points, policy identity, raw bypass limits and buffer/provider lifetimes; neither gate is satisfied by test counts alone.
 PR2 implements replace/upsert, guarded full-document queries and latest-version pull change feed; PR3 plans native bulk and typed-only transactional batch.

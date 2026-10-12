@@ -4,7 +4,7 @@
 - **Scope:** .NET lifecycle updates, guarded full-document queries and latest-version pull change feed.
 - **Baseline:** PR1 commit `ebc2c4f`.
 - **SDK/runtime:** .NET 10, Azure Cosmos DB SDK 3.63.2.
-- **Live Azure status:** Not executed; external credentials, dedicated `/pk` container and exact `COSMOS_RUN_LIVE_TESTS=1` opt-in were not available. Discovery remained secrets-free and skipped the nine live theory methods (30 enabled Direct/Gateway rows).
+- **Live Azure status:** Passed against the externally configured dedicated `/pk` container: all 30 Direct/Gateway rows passed and confirmed test items were cleaned up. No endpoint, credential or key value is recorded here.
 - **Review status:** Automated evidence is not user approval or security-team approval. All five sample-only `Unsafe` providers still require security-team validation/replacement.
 
 ## Executed checks
@@ -13,7 +13,8 @@ From the repository root:
 
 | Check | Result |
 | --- | --- |
-| `dotnet test dotnet/CosmosContentValidation.slnx -c Release --no-restore` | Passed: solution build plus 630 offline tests; 9 live theory methods skipped; 0 failed (639 total). |
+| `dotnet test dotnet/CosmosContentValidation.slnx -c Release --no-restore` | Passed after the live-discovered fix: solution build plus 631 offline tests; 9 live theory methods skipped without opt-in; 0 failed (640 total). |
+| Opted-in `dotnet test` of the live-test project with externally supplied system environment | Passed: 30/30 enabled Direct/Gateway rows, 0 failed, 0 skipped. Cleanup reported success. |
 | `dotnet run --project dotnet/samples/CosmosContentValidation.Sample/CosmosContentValidation.Sample.csproj -c Release --no-build -- --offline` | Passed all serializer, replay, tamper, exclusion-policy and key-isolation checks without Azure clients or credentials. |
 | `dotnet run --project dotnet/samples/CosmosContentValidation.Sample/CosmosContentValidation.Sample.csproj -c Release --no-build -- --help` | Passed; documented PR2 lifecycle/query/feed configuration and limitations without key or credential access. |
 | `dotnet pack dotnet/src/CosmosContentValidation/CosmosContentValidation.csproj -c Release --no-restore -o artifacts/pr2-pack` | Passed; produced `CosmosContentValidation.0.1.0.nupkg`. |
@@ -33,7 +34,6 @@ From the repository root:
 
 ## Pending gates
 
-- Run the 30 enabled live Direct/Gateway rows against a dedicated preprovisioned Azure container and record the result.
 - User review of the PR2 public API, guarded SQL subset, query parameter ownership, response facade and checkpoint semantics.
 - Future owning security-team validation or replacement of every sample-only `Unsafe` provider.
 - PR3 bulk/batch work and all Java/cross-language work remain out of scope.

@@ -178,7 +178,7 @@ both hashes and signatures passed, and hashing the digest again failed verificat
 [CryptoTests](../dotnet/tests/CosmosContentValidation.Tests/CryptoTests.cs) covers independent prehash interoperability and rejection of double hashing/DER.
 [CanonicalizationTests](../dotnet/tests/CosmosContentValidation.Tests/CanonicalizationTests.cs) covers numeric/Unicode/depth acceptance, not unrestricted JCS conformance.
 These source tests do not establish that the new provider-boundary or guard tests have passed; see the
-[latest recorded validation evidence](pr2-validation.md) for executed checks, not an inferred result for subsequent edits.
+[latest recorded validation evidence](pr2-validation.md) for executed offline and live checks, not an inferred result for subsequent edits.
 The future security team is responsible for validating all replacement providers and their dependencies;
 user review must approve public interfaces, wire identifiers, exclusion identity, prehash semantics, provider ownership,
 restricted numeric acceptance and the [stored-procedure/write-trigger boundary](security-and-supported-operations.md).

@@ -2,7 +2,7 @@
 
 - **Date:** 2026-10-12
 - **Status:** Approved plan, updated requirements: configurable ignored root properties, sample-only `Unsafe` providers, and explicit stored-procedure/write-trigger execution boundaries.
-- **Delivery:** PR1 is committed and PR2 is implemented in the working tree. Current PR2 offline evidence is recorded in [pr2-validation.md](pr2-validation.md). Live Azure verification, future security-team provider validation/replacement and user review remain pending. PR3–PR5 are not started.
+- **Delivery:** PR1 is committed and PR2 is implemented in the working tree. Current offline and 30-row Direct/Gateway live evidence is recorded in [pr2-validation.md](pr2-validation.md). Future security-team provider validation/replacement and user review remain pending. PR3–PR5 are not started.
 - **Sequence:** PR1 → PR2 → PR3 → PR4 → PR5; finish .NET before Java. Parallel work is permitted only within a PR after its interface prerequisites.
 - **Implementation scope:** PR2 only: .NET lifecycle updates, guarded item queries and latest-version pull change feed. SDK source and PR3–PR5 remain unchanged. Builds and verification are recorded separately from human interface/wire-format approval.
 - **Baseline:** Repository initially contains README, MIT license, ignore rules, and Git metadata on `main`; no application/build/CI scaffolding. Commits, pushes, and starting subsequent PRs remain subject to the normal user workflow.
@@ -123,7 +123,7 @@ Run offline tests for each PR and explicitly opted-in live Azure integration tes
 
 ### PR1 — Shared contract, .NET create/read, stream foundation
 
-**Status:** PR1 foundation implemented; prior offline results are recorded, not evidence for subsequent provider/guard edits. **Dependencies:** None. **Review/validation gates still pending:** verification of new changes, live Azure execution, future security-team validated provider replacements, and user public-interface, wire-format, exclusion-policy, boundary and ownership review.
+**Status:** PR1 foundation implemented and its live scenarios passed as part of the PR2 validation run. **Dependencies:** None. **Review/validation gates still pending:** future security-team validated provider replacements and user public-interface, wire-format, exclusion-policy, boundary and ownership review.
 
 - [ ] **P1.1** Specify protocol, numeric domain, error model, no-I/O key lifecycle, staged interfaces, immutable policy and stream ownership; obtain user review of fixed v1 constraints and provider boundary, and security-team validation/replacement approval separately. **REQ-002–006, REQ-018–019**
 - [x] **P1.2** Scaffold .NET solution, reusable DLL, console and xUnit unit/live test projects; pin dependencies and add secrets-free offline CI, README and ignore-rule updates. **REQ-001, REQ-017**
@@ -145,7 +145,7 @@ Six live theory groups (24 enabled Direct/Gateway cases) require external Azure 
 
 ### PR2 — .NET lifecycle, queries, latest-version change feed
 
-**Status:** Implemented; offline validation passed. Live Azure execution, security-team provider validation/replacement and user review remain pending. **Depends on:** PR1.
+**Status:** Implemented; offline validation and all 30 Direct/Gateway live rows passed. Security-team provider validation/replacement and user review remain pending. **Depends on:** PR1.
 
 Carry REQ-019's sample-only provider boundary and REQ-016's stored-procedure/write-trigger guards forward; adding APIs must not add library provider defaults.
 
@@ -192,7 +192,7 @@ Retain REQ-019's sample-only `Unsafe` implementations, required injection and fu
 
 ## 8. Verification and security boundaries
 
-- Each PR must independently build, test and package its available library/console: .NET build/test, Maven verify, and explicit live profile after scaffolding. The [PR2 validation report](pr2-validation.md) records current offline results; it makes no live-Azure, review or future-PR claim.
+- Each PR must independently build, test and package its available library/console: .NET build/test, Maven verify, and explicit live profile after scaffolding. The [PR2 validation report](pr2-validation.md) records current offline and live results; it makes no security-review, user-review or future-PR claim.
 - Offline tests cover stage ordering, wrong digest length/double hashing, default/custom root versus nested exclusions, policy mismatch, missing/invalid signature, unknown profile/key, arrays/null/missing, escaped names/property ordering, safe-number boundaries, invalid input, concurrency, mutation and I/O-free providers.
 - Stream tests prove readability after validation, restored seekable positions, non-seekable replacement replay, response/error metadata preservation, cancellation, no use-after-return/double-return/finalizer reliance/shared cursors, and no extra `ToArray`/repeated flattening. Include pool concurrency/memory-growth tests and non-brittle allocation benchmarks.
 - Guard tests must prove rejection **before content read/signing/enqueue/submission**, including every stored-procedure execution overload before delegate access, nonempty pre/post triggers on all writes, zero-result projections and remove-only/ignored-target Patch in bulk/batch. Empty trigger lists must be detached before input consumption; reads keep ordinary option checks/copies without write-trigger rejection. Startup metadata network calls are distinct from submitting a content operation.

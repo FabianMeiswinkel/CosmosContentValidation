@@ -47,7 +47,7 @@ Offline success exits 0. The larger offline unit suite remains in its existing p
 the console checks do not replace it. Live tests are discovered but **skipped** unless
 the exact environment value `COSMOS_RUN_LIVE_TESTS=1` is set. Any other value skips.
 Consult the [latest recorded validation evidence](pr2-validation.md) for executed results.
-That report records offline validation only; live Azure execution remains pending explicit opt-in and external configuration.
+That report records both offline validation and a successful explicitly opted-in 30-row Direct/Gateway Azure run.
 
 ## Online prerequisites and configuration
 

@@ -250,12 +250,19 @@ public sealed class ContentValidationProcessor
 
     /// <summary>Validates all documents before copying them without their root envelopes.</summary>
     public RecyclableMemoryStream ValidateAndStrip(ReadOnlySequence<byte> json, bool allowArray = false)
+        => ValidateAndStrip(json, allowArray, ignoreChangeFeedLsn: false);
+
+    /// <summary>Validates a typed feed array while ignoring Cosmos' returned root _lsn metadata.</summary>
+    internal RecyclableMemoryStream ValidateFeedAndStrip(ReadOnlySequence<byte> json)
+        => ValidateAndStrip(json, allowArray: true, ignoreChangeFeedLsn: true);
+
+    private RecyclableMemoryStream ValidateAndStrip(ReadOnlySequence<byte> json, bool allowArray, bool ignoreChangeFeedLsn)
     {
         using JsonDocument parsed = ParseInput(json, allowArray);
         JsonElement root = parsed.RootElement;
         if (root.ValueKind == JsonValueKind.Array)
         {
-            foreach (JsonElement document in root.EnumerateArray()) ValidateDocument(document);
+            foreach (JsonElement document in root.EnumerateArray()) ValidateDocument(document, ignoreChangeFeedLsn);
             return WritePooled(writer =>
             {
                 writer.WriteStartArray();

@@ -93,7 +93,7 @@ public sealed class FeedIteratorTests
     [Fact]
     public async Task ChangeFeedOnlyLsnIsUnauthenticatedButPointDocumentsStillRejectIt()
     {
-        using Harness harness = new();
+        using Harness harness = new(createClient: true);
         JsonObject document = JsonNode.Parse(harness.Sign("one", 1))!.AsObject();
         document["_lsn"] = 42;
         byte[] page = harness.Page(document.ToJsonString());
@@ -103,6 +103,11 @@ public sealed class FeedIteratorTests
         using ResponseMessage response = await iterator.ReadNextAsync();
 
         Assert.Equal(page, await ReadAll(response.Content));
+        using ContentValidationFeedIterator<TypedItem> typed = new(
+            new FakeIterator(Response(HttpStatusCode.OK, new TrackingStream(page))),
+            harness.Processor, harness.Client!.ResponseFactory);
+        FeedResponse<TypedItem> typedResponse = await typed.ReadNextAsync();
+        Assert.Equal("one", Assert.Single(typedResponse).Id);
         Assert.Equal(ContentValidationFailure.InvalidSignature,
             Assert.Throws<ContentValidationException>(() => harness.Processor.Validate(
                 new ReadOnlySequence<byte>(Encoding.UTF8.GetBytes(document.ToJsonString())))).Failure);
