@@ -9,9 +9,9 @@ namespace CosmosContentValidation;
 
 /// <summary>A fail-closed Cosmos SDK client for preprovisioned containers.</summary>
 /// <remarks>
-/// PR1 supports point create/read/delete (typed and stream), guarded navigation, account reads,
-/// and scalar throughput reads. Resource-returning management, queries, feeds, bulk, batch,
-/// replace, upsert, patch, scripts, conflicts and LINQ are deliberately unavailable.
+/// Supports protected point lifecycle operations, guarded full-document item queries and
+/// latest-version pull change feed. Resource-returning management, bulk, batch, patch, scripts,
+/// conflicts, LINQ and full-fidelity change feed are deliberately unavailable.
 /// Before use, independently check that every target container's actual partition-key paths
 /// exactly match the processor's configured paths. No provisioning or key I/O is performed here.
 /// The client owns only its inner SDK client; the processor and providers remain caller-owned.
@@ -86,7 +86,7 @@ public sealed class ContentValidationClient : CosmosClient
         // Calling base.Dispose(bool) would dereference that uninitialized context.
     }
 
-    internal static NotSupportedException Unsupported() => new("This operation is not supported by the PR1 content-validation client. Use preprovisioned containers and point create/read/delete only.");
+    internal static NotSupportedException Unsupported() => new("This operation is not supported by the content-validation client. Use only its documented protected operation surface.");
 
     private static CosmosClientOptions ValidateAndCopyOptions(CosmosClientOptions? options)
     {

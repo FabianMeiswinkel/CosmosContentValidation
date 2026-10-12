@@ -23,6 +23,7 @@ namespace CosmosContentValidation;
 public sealed class ContentValidationProcessor
 {
     public const string SignaturePropertyName = "_contentValidation";
+    private const string ChangeFeedLsnPropertyName = "_lsn";
     // Fixed v1 wire compatibility identifiers and lengths, not algorithm implementations.
     private const string CanonicalizationProfile = "rfc8785-binary64-v1";
     private const string HashAlgorithm = "SHA-256";
@@ -121,6 +122,132 @@ public sealed class ContentValidationProcessor
         ValidateDocument(parsed.RootElement);
     }
 
+    /// <summary>Validates every raw document in an unchanged query or change-feed envelope.</summary>
+    internal void ValidateFeedPage(ReadOnlySequence<byte> json) => _ = ReadFeedPage(json, validateDocuments: true);
+
+    /// <summary>Creates the unambiguous single-array envelope required by the native typed factory.</summary>
+    internal MemoryStream NormalizeFeedPageForFactory(ReadOnlySequence<byte> json)
+    {
+        // The installed validating serializer performs the sole cryptographic pass over this
+        // array before mapping. This pass validates and bounds the service-envelope structure.
+        ReadOnlySequence<byte> documents = ReadFeedPage(json, validateDocuments: false);
+        // Cosmos 3.63.2's public response factory requires a contiguous MemoryStream envelope
+        // and slices its backing array before invoking the configured serializer.
+        MemoryStream normalized = new(checked((int)documents.Length + 14));
+        try
+        {
+            normalized.Write("{\"Documents\":"u8);
+            foreach (ReadOnlyMemory<byte> segment in documents) normalized.Write(segment.Span);
+            normalized.WriteByte((byte)'}');
+            normalized.Position = 0;
+            return normalized;
+        }
+        catch
+        {
+            normalized.Dispose();
+            throw;
+        }
+    }
+
+    private ReadOnlySequence<byte> ReadFeedPage(ReadOnlySequence<byte> json, bool validateDocuments)
+    {
+        CheckLength(json.Length, Buffers.MaxBufferBytes);
+        ReadOnlySequence<byte>? documentsArray = null;
+        try
+        {
+            using JsonDocument parsed = JsonDocument.Parse(json, new JsonDocumentOptions { MaxDepth = 66 });
+            JsonElement root = parsed.RootElement;
+            if (root.ValueKind != JsonValueKind.Object)
+                throw new JsonException("A feed page must be an object.");
+            ValidateEnvelopeJson(root);
+
+            int documentsProperties = 0;
+            foreach (JsonProperty property in root.EnumerateObject())
+            {
+                if (property.Name != "Documents") continue;
+                documentsProperties++;
+                if (property.Value.ValueKind != JsonValueKind.Array)
+                    throw new JsonException("The Documents property must be an array.");
+            }
+            if (documentsProperties != 1)
+                throw new JsonException("A feed page requires exactly one Documents property.");
+
+            Utf8JsonReader reader = new(json, new JsonReaderOptions { MaxDepth = 66 });
+            if (!reader.Read() || reader.TokenType != JsonTokenType.StartObject)
+                throw new JsonException("A feed page must be an object.");
+            bool ended = false;
+            while (reader.Read())
+            {
+                if (reader.TokenType == JsonTokenType.EndObject)
+                {
+                    ended = true;
+                    break;
+                }
+                if (reader.TokenType != JsonTokenType.PropertyName)
+                    throw new JsonException("A feed page property name was expected.");
+                string propertyName = reader.GetString()!;
+                if (!reader.Read()) throw new JsonException("A feed page property value was expected.");
+                if (propertyName != "Documents")
+                {
+                    reader.Skip();
+                    continue;
+                }
+                if (reader.TokenType != JsonTokenType.StartArray)
+                    throw new JsonException("The Documents property must be an array.");
+                long arrayStart = reader.TokenStartIndex;
+                bool arrayEnded = false;
+                while (reader.Read())
+                {
+                    if (reader.TokenType == JsonTokenType.EndArray)
+                    {
+                        arrayEnded = true;
+                        break;
+                    }
+                    long start = reader.TokenStartIndex;
+                    reader.Skip();
+                    long length = reader.BytesConsumed - start;
+                    CheckLength(length, MaxDocumentBytes);
+                }
+                if (!arrayEnded) throw new JsonException("The Documents array is incomplete.");
+                documentsArray = json.Slice(arrayStart, reader.BytesConsumed - arrayStart);
+            }
+            if (!ended || reader.Read()) throw new JsonException("The feed page has trailing JSON.");
+        }
+        catch (Exception exception) when (exception is JsonException or InvalidOperationException
+            or FormatException or DecoderFallbackException)
+        {
+            throw Failure(ContentValidationFailure.InvalidDocument, "The feed page is not a supported JSON envelope.",
+                new JsonException("Malformed JSON, duplicate names, invalid Unicode, depth or envelope shape."));
+        }
+
+        // Documents is known to occur exactly once and every item was measured from its borrowed
+        // raw sequence. Keep trusted-provider calls outside the JSON translation catch so local
+        // invariant failures are never misreported as malformed untrusted input.
+        ReadOnlySequence<byte> documents = documentsArray!.Value;
+        if (validateDocuments) ValidateFeedDocuments(documents);
+        return documents;
+    }
+
+    private void ValidateFeedDocuments(ReadOnlySequence<byte> documents)
+    {
+        Utf8JsonReader reader = new(documents, new JsonReaderOptions { MaxDepth = 65 });
+        if (!reader.Read() || reader.TokenType != JsonTokenType.StartArray)
+            throw new JsonException("The normalized Documents value must be an array.");
+        ReadOnlySequence<byte> remaining = documents;
+        long remainingOffset = 0;
+        while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
+        {
+            long start = reader.TokenStartIndex;
+            reader.Skip();
+            long length = reader.BytesConsumed - start;
+            ReadOnlySequence<byte> documentBytes = remaining.Slice(start - remainingOffset, length);
+            using JsonDocument document = ParseInput(documentBytes, allowArray: false);
+            ValidateDocument(document.RootElement, ignoreChangeFeedLsn: true);
+            remaining = documents.Slice(reader.Position);
+            remainingOffset = reader.BytesConsumed;
+        }
+    }
+
     /// <summary>Validates all documents before copying them without their root envelopes.</summary>
     public RecyclableMemoryStream ValidateAndStrip(ReadOnlySequence<byte> json, bool allowArray = false)
     {
@@ -189,6 +316,36 @@ public sealed class ContentValidationProcessor
         canonicalizer.ValidateInput(document);
     }
 
+    private static void ValidateEnvelopeJson(JsonElement value)
+    {
+        switch (value.ValueKind)
+        {
+            case JsonValueKind.Object:
+                HashSet<string> names = new(StringComparer.Ordinal);
+                foreach (JsonProperty property in value.EnumerateObject())
+                {
+                    if (!IsValidUnicode(property.Name) || !names.Add(property.Name))
+                        throw new JsonException("Feed envelope property names must be unique valid Unicode.");
+                    ValidateEnvelopeJson(property.Value);
+                }
+                break;
+            case JsonValueKind.Array:
+                foreach (JsonElement item in value.EnumerateArray()) ValidateEnvelopeJson(item);
+                break;
+            case JsonValueKind.String:
+                if (!IsValidUnicode(value.GetString()!))
+                    throw new JsonException("Feed envelope strings must be valid Unicode.");
+                break;
+            case JsonValueKind.Number:
+            case JsonValueKind.True:
+            case JsonValueKind.False:
+            case JsonValueKind.Null:
+                break;
+            default:
+                throw new JsonException("The feed envelope contains an unsupported JSON token.");
+        }
+    }
+
     private void ValidateIdentity(JsonElement document)
     {
         if (!document.TryGetProperty("id", out JsonElement idElement) || idElement.ValueKind != JsonValueKind.String)
@@ -209,7 +366,7 @@ public sealed class ContentValidationProcessor
         }
     }
 
-    private void ValidateDocument(JsonElement document)
+    private void ValidateDocument(JsonElement document, bool ignoreChangeFeedLsn = false)
     {
         ValidateIdentity(document);
         if (!document.TryGetProperty(SignaturePropertyName, out JsonElement envelope))
@@ -222,7 +379,7 @@ public sealed class ContentValidationProcessor
             throw new InvalidOperationException("The key resolver returned a provider with a different key identifier.");
         if (!string.Equals(verifier.AlgorithmId, header.SignatureAlgorithm, StringComparison.Ordinal))
             throw Failure(ContentValidationFailure.UnsupportedProfile, "The trusted verification provider uses an incompatible algorithm.");
-        byte[] digest = ComputeDocumentHash(document, header);
+        byte[] digest = ComputeDocumentHash(document, header, ignoreChangeFeedLsn);
         if (!verifier.VerifyHash(digest, signature))
             throw Failure(ContentValidationFailure.InvalidSignature, "The content signature is invalid.");
     }
@@ -250,14 +407,15 @@ public sealed class ContentValidationProcessor
         return (new(canonicalization, hashAlgorithm, signatureAlgorithm, policy, keyId), signature);
     }
 
-    private byte[] ComputeDocumentHash(JsonElement document, Header header)
+    private byte[] ComputeDocumentHash(JsonElement document, Header header, bool ignoreChangeFeedLsn = false)
     {
         CheckTrustedProfiles();
         using RecyclableMemoryStream filtered = WritePooled(writer =>
         {
             writer.WriteStartObject();
             foreach (JsonProperty property in document.EnumerateObject())
-                if (property.Name != SignaturePropertyName && !ignoredProperties.Contains(property.Name)) property.WriteTo(writer);
+                if (property.Name != SignaturePropertyName && !ignoredProperties.Contains(property.Name)
+                    && !(ignoreChangeFeedLsn && property.Name == ChangeFeedLsnPropertyName)) property.WriteTo(writer);
             writer.WriteEndObject();
         }, Buffers.MaxBufferBytes);
         using JsonDocument filteredTree = JsonDocument.Parse(filtered.GetReadOnlySequence(), new JsonDocumentOptions { MaxDepth = 64 });

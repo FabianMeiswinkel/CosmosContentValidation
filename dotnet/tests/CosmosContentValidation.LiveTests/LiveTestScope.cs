@@ -92,7 +92,7 @@ internal sealed class LiveConfiguration
 
     private static CosmosClientOptions Options(ConnectionMode mode) => new()
     {
-        ApplicationName = "ContentValidation-PR1-LiveTests",
+        ApplicationName = "ContentValidation-PR2-LiveTests",
         ConnectionMode = mode,
         ConsistencyLevel = ConsistencyLevel.Session,
         RequestTimeout = TimeSpan.FromSeconds(10),
@@ -123,7 +123,7 @@ internal sealed class LiveItem(string id, string partitionKey)
 }
 
 /// <summary>
-/// No resource provisioning or queries. The raw client can patch/delete only ledger entries whose
+/// No resource provisioning. The raw client can tamper/delete only ledger entries whose
 /// create returned success. A create that throws after commit is ambiguous and is NEVER auto-deleted.
 /// </summary>
 internal sealed class LiveTestScope(ITestOutputHelper output, CancellationToken token)
@@ -200,10 +200,11 @@ internal sealed class LiveTestScope(ITestOutputHelper output, CancellationToken 
         Log($"Verified /pk container; mode={mode}; policy={(customPolicy ? "custom-root" : "default")}; reader is public-only.");
     }
 
-    internal LiveItem NewItem()
+    internal LiveItem NewItem(string? partitionSuffix = null)
     {
         LiveCheck.Require(items.Count < 2, "The per-test item budget is two identities, including failed attempts.");
-        LiveItem item = new(prefix + "-" + Guid.NewGuid().ToString("N"), prefix);
+        LiveItem item = new(prefix + "-" + Guid.NewGuid().ToString("N"),
+            partitionSuffix is null ? prefix : prefix + "-" + partitionSuffix);
         items.Add(item); // Register generated identity BEFORE any attempt, including public-only attempts.
         return item;
     }
@@ -263,6 +264,57 @@ internal sealed class LiveTestScope(ITestOutputHelper output, CancellationToken 
         }
     }
 
+    internal async Task<ItemResponse<LiveDocument>> UpsertTypedAsync(LiveItem item, LiveDocument document,
+        bool enableContentResponse = true)
+    {
+        bool inserting = !item.Attempted;
+        if (inserting) BeginCreate(item);
+        else LiveCheck.Require(items.Contains(item) && item.Confirmed, "Upsert update requires this test's acknowledged item.");
+        try
+        {
+            ItemResponse<LiveDocument> response = await Writer.UpsertItemAsync(document, item.PartitionKey,
+                new ItemRequestOptions { EnableContentResponseOnWrite = enableContentResponse }, Token);
+            if ((int)response.StatusCode is >= 200 and <= 299)
+            {
+                if (inserting) item.Confirmed = true;
+                ObserveWrite(item, response.Headers);
+            }
+            return response;
+        }
+        catch (Exception exception)
+        {
+            if (inserting) WarnUnacknowledgedCreate(item, exception);
+            throw;
+        }
+    }
+
+    internal async Task<ResponseMessage> UpsertStreamAsync(LiveItem item, Stream payload,
+        bool enableContentResponse = true)
+    {
+        bool inserting = !item.Attempted;
+        if (inserting) BeginCreate(item);
+        else LiveCheck.Require(items.Contains(item) && item.Confirmed, "Upsert update requires this test's acknowledged item.");
+        ResponseMessage? response = null;
+        try
+        {
+            response = await Writer.UpsertItemStreamAsync(payload, item.PartitionKey,
+                new ItemRequestOptions { EnableContentResponseOnWrite = enableContentResponse }, Token);
+            if (response.IsSuccessStatusCode)
+            {
+                if (inserting) item.Confirmed = true;
+                ObserveWrite(item, response.Headers);
+            }
+            return response;
+        }
+        catch (Exception exception)
+        {
+            if (inserting) WarnUnacknowledgedCreate(item, exception);
+            try { response?.Dispose(); }
+            catch (Exception disposalFailure) { Log("Upsert response disposal failed: " + LiveCheck.Sanitize(disposalFailure).Message); }
+            throw;
+        }
+    }
+
     private void WarnUnacknowledgedCreate(LiveItem item, Exception exception)
     {
         if (item.Confirmed || exception is ContentValidationException { Failure: ContentValidationFailure.SigningUnavailable }) return;
@@ -280,7 +332,7 @@ internal sealed class LiveTestScope(ITestOutputHelper output, CancellationToken 
         item.ETag = headers.ETag;
     }
 
-    internal async Task PatchAsync(LiveItem item, params PatchOperation[] operations)
+    internal async Task TamperAsync(LiveItem item, params PatchOperation[] operations)
     {
         LiveCheck.Require(items.Contains(item) && item.Confirmed, "Raw patch is limited to this test's acknowledged creates.");
         ItemRequestOptions session = item.ReadOptions();

@@ -1,4 +1,4 @@
-# Security and supported operations (PR1)
+# Security and supported operations (PR2)
 
 This describes the current .NET 10 library with Cosmos SDK **3.63.2**, not every SDK version or later planned PR.
 Read with the [wire protocol](content-validation-protocol.md), [approved plan](implementation-plan.md) and [live-test guide](live-tests.md).
@@ -39,20 +39,25 @@ The [client](../dotnet/src/CosmosContentValidation/Cosmos/ContentValidationClien
 [database](../dotnet/src/CosmosContentValidation/Cosmos/ContentValidationDatabase.cs) and
 [container](../dotnet/src/CosmosContentValidation/Cosmos/ContentValidationContainer.cs) are public SDK-derived wrappers.
 
-| Surface | PR1 behavior |
+| Surface | PR2 behavior |
 | --- | --- |
 | Typed `CreateItemAsync<T>` | Sign via the installed serializer; require signer, explicit partition key, safe type/options. |
+| Typed `ReplaceItemAsync<T>` / `UpsertItemAsync<T>` | Re-sign current content; support ETag replace and response-content on/off. A status-only success requires a later protected readback for content assurance. |
 | Typed `ReadItemAsync<T>` | Validate raw document before ordinary mapping; invalid/missing signatures fail. |
 | `CreateItemStreamAsync` | Snapshot input, sign via the shared processor, validate any nonempty successful returned document. |
+| `ReplaceItemStreamAsync` / `UpsertItemStreamAsync` | Snapshot and re-sign current JSON once; retain replay through SDK retries; validate any nonempty successful returned document. |
 | `ReadItemStreamAsync` | Validate the successful body before returning a rewound, unchanged signed JSON stream. |
 | Typed/stream point delete | Allowed for cleanup without a signing key or prior valid signature; not proof of deleted-content validation. |
+| Six typed/stream item-query overloads | Guard original SQL, options and targets before native iterator construction. Validate every document in every returned `Documents` page. |
+| `ContentValidationQueryDefinition` | Supported parameterized-query builder. Ordinary values remain unsigned query parameters; raw JSON/stream values are strict, bounded snapshots. Native parameterized definitions are rejected. |
+| Typed/stream pull change feed | Latest-version/incremental mode only; validate complete pages before returning/materializing. Preserve 304 responses and continuations. |
 | `GetDatabase`, `GetContainer`, `Database.Client`, `Container.Database` | Navigation remains inside the guarded hierarchy. |
 | `ReadAccountAsync`, scalar `ReadThroughputAsync(CancellationToken)` | Allowed native metadata/scalar utilities, **not** authenticated document reads. |
 | Database/container management and resource-returning throughput responses | Blocked, including metadata reads, provisioning, replacement and deletion. |
-| Replace, upsert, patch (including ignored-field-only patch), read-many, partition-wide delete | Blocked before inner content submission. |
-| Queries, LINQ, all change-feed/processor/estimator APIs and feed-range APIs | Blocked in PR1. |
+| Patch (including ignored-field-only patch), read-many, partition-wide delete | Blocked before inner content submission. |
+| LINQ, full-fidelity change feed, change-feed processor/estimator and feed-range discovery | Blocked. Query feed-range overloads are guarded and supported only with a caller-supplied `FeedRange`. |
 | Stored-procedure execution: typed and both stream overloads | `Container.Scripts` throws before accessing the inner delegate; no execution or argument-stream consumption. All scripts access is blocked. |
-| Writes requesting nonempty `PreTriggers` or `PostTriggers` | Rejected before content read/signing/submission for typed/stream create and delete; the same rule is required for future replace/upsert. |
+| Writes requesting nonempty `PreTriggers` or `PostTriggers` | Rejected before content read/signing/submission for typed/stream create, replace, upsert and delete. |
 | Empty write-trigger lists | Allowed because no trigger is requested; copied before content is read or the request is submitted. |
 | Read options with trigger lists | Copied with ordinary supported options, without applying the write-trigger guard; this does not enable trigger execution on reads. |
 | Bulk, transactional batch, conflicts, users/permissions and client-encryption-key management | Not exposed as supported protected operations. |
@@ -102,6 +107,21 @@ then rejects a write if either copied list is nonempty. Typed/stream create and 
 Null/empty write lists request no invocation and are allowed; later caller mutation cannot attach a trigger to the detached snapshot.
 `ReadItemAsync<T>` and `ReadItemStreamAsync` pass `isWrite: false`: even nonempty lists are copied, not rejected by the write-trigger guard.
 Ordinary option validation still applies on reads. Derived options, `Properties`, `AddRequestHeaders` and availability hooks remain rejected.
+Query and change-feed options are likewise copied through their reviewed public 3.63.2 surfaces. Mutable region lists and supported nested
+gateway/threshold settings are detached. Custom properties, header callbacks, availability hooks and inherited ETag options are rejected.
+Successful stream query pages use a response facade because Cosmos 3.63.2 query responses can synthesize content and ignore a base-content
+replacement. The facade delegates virtual status/headers/continuation/diagnostics and owns both the native response and validated pooled body.
+`IndexMetrics` is nonvirtual, and public typed response-factory conversion cannot retain native query metrics/advice either. Both typed and stream
+queries explicitly requesting index metrics or query advice (`true`) are therefore rejected; explicit `false` is accepted rather than treated as a request.
+SDK option-surface reflection tests are upgrade tripwires, not production reflection.
+
+`ContentValidationQueryDefinition` retains ordinary parameter values until an iterator is created, then serializes each through the ordinary
+delegate without document signing and feeds a fresh native definition through public `WithParameterStream`. That build is the immutable request
+snapshot; later caller mutation cannot change the submitted parameters. Raw JSON values and parameter streams are copied immediately, strict
+UTF-8 JSON checked, bounded to one MiB and never treated as signed documents. Parameter streams are consumed from their current position and
+disposed, matching the native API ownership contract. Casting the builder to `QueryDefinition` and adding base parameters is detected and rejected.
+Arbitrary native parameterized definitions are also rejected because public APIs do not expose the raw values of stream parameters safely.
+Native parameterless definitions are rebuilt from their unchanged query text.
 Processor exclusion/path options are also copied. Do not mutate supplied objects concurrently with construction/snapshotting.
 Injectable crypto/canonicalizer implementations must retain the fixed v1 profile/algorithm semantics; they do not enable arbitrary algorithm negotiation.
 The same injected canonicalizer and hasher compute policy identity and document digests; no hidden built-in provider handles policy hashing.
@@ -128,6 +148,21 @@ Non-success stream responses, including HTTP 304 and service errors, pass throug
 Delete stream responses also pass through without document parsing, even if nonempty; cleanup is intentionally not a document-validation operation.
 Native typed service-error behavior remains the SDK's. A later readback can validate returned content, but does not establish freshness or proof of write.
 Verification/materialization may fail **after a create committed**; the exception does not roll back the write or prove it never happened.
+
+Query text is not signed. The lexical guard permits only a complete-document root shape beginning `SELECT * FROM <identifier>`, with an optional
+ordinary alias. It rejects projections, `VALUE`, `TOP`/`DISTINCT`, nested `FROM` sources, collection iteration, joins and comma sources before
+creating the native iterator—including queries that would return zero rows. WHERE/ORDER BY/OFFSET/LIMIT tails are not proof of service behavior.
+Every returned document must still validate, but signatures do **not** prove result completeness, filter correctness, order or freshness.
+
+Successful query/change-feed stream pages must be strict JSON objects with exactly one case-sensitive `Documents` array. Duplicate/missing/wrong-case
+properties, malformed UTF-8, trailing JSON and oversized pages/items fail closed. Unrelated envelope fields remain untrusted and byte-preserved.
+Latest-version change feed adds the documented root `_lsn` batch/transaction identifier after the stored item was signed. Feed hash recomputation
+therefore excludes only that returned root `_lsn` as unauthenticated service metadata. This operation-specific exception does not alter the v1
+five-field exclusion policy/fingerprint: point documents containing an added or modified `_lsn` still fail signature validation.
+All documents validate before a page is returned or any typed target is constructed. A valid empty `Documents` page is allowed. Native errors and
+304 change-feed responses are returned untouched and unverified. A local page-validation/materialization/cancellation failure poisons that iterator;
+a transport exception before any response is acquired remains retryable. Applications advance persisted continuation/checkpoint state only after
+successful validation and application processing. Latest-version feed does not expose intermediate versions or deletes.
 
 ## 6. Stream and provider ownership
 
@@ -160,6 +195,9 @@ It uses cleared pooled scratch where needed and completes outstanding reservatio
 this works around RMS 3.0.1 not returning a temporary `IBufferWriter` reservation on disposal after a failed write.
 Sequence-based hashing avoids flattening/`ToArray`; the configured pool throws on stream `ToArray`. `GetBuffer` may consolidate/copy segments.
 This is **not zero-copy or zero-allocation**: the sample's `UnsafeJcsCanonicalizer` uses Jcs.Net, which returns a full canonical byte array per canonicalized subtree that the adapter writes into its destination.
+Typed feed materialization has one additional documented contiguous copy: Cosmos 3.63.2's public response factory requires a contiguous
+`MemoryStream` service envelope and slices its backing array before invoking the configured serializer. The wrapper bounds that copy and performs
+cryptographic verification once in the validating serializer; stream pages remain pooled and preserve the exact service envelope.
 `JsonDocument`, filtered trees, mapping, small digest/signature arrays and reservation scratch also allocate or copy; these are accepted boundaries.
 Pooled content has `ZeroOutBuffer=true`, and scratch is returned with `clearArray: true`; these library buffer utilities need no direct crypto reference.
 Separately, the sample's `UnsafeEcdsaKeyImport` zeroes decoded key DER. Immutable PEM strings and all managed copies are not erasable.
@@ -182,12 +220,12 @@ it does not certify provider security or all transitives. [ProcessorTests](../do
 covers explicit constructor dependencies, required whole-input validation and delegated policy hashing.
 [SerializerTests](../dotnet/tests/CosmosContentValidation.Tests/SerializerTests.cs), [SerializerDisposalTests](../dotnet/tests/CosmosContentValidation.Tests/SerializerDisposalTests.cs)
 and [BufferPoolTests](../dotnet/tests/CosmosContentValidation.Tests/BufferPoolTests.cs) cover pre-mapping validation, replay, offsets, cancellation and ownership.
-See [latest recorded PR1 validation evidence](pr1-validation.md) for executed build, offline test, demo and packaging checks.
-Earlier evidence does not establish that these newly added/updated tests passed; verification of the refactor and guards must be recorded separately. Live Azure execution remains pending.
+See [latest recorded PR2 validation evidence](pr2-validation.md) for executed build, offline test, demo and packaging checks.
+Current PR2 offline verification is recorded in [pr2-validation.md](pr2-validation.md). Live Azure execution remains pending.
 The future security team owns validation and replacement of all concrete providers and their dependencies. User review must approve public interfaces,
 all guarded SDK entry points, policy identity, raw bypass limits and buffer/provider lifetimes; neither gate is satisfied by test counts alone.
-PR2 plans replace/upsert, guarded full-document queries and latest-version pull change feed; PR3 plans native bulk and typed-only transactional batch.
-PR2/PR3 must retain sample-only providers, block stored-procedure execution and apply the write-trigger rule to every newly supported write,
+PR2 implements replace/upsert, guarded full-document queries and latest-version pull change feed; PR3 plans native bulk and typed-only transactional batch.
+PR3 must retain sample-only providers, block stored-procedure execution and apply the write-trigger rule to every newly supported write,
 including relevant bulk/batch entry points before enqueue/submission, without adding it to reads. Java must preserve equivalent boundaries and tests in PR4/PR5.
-Java and cross-language live validation remain future work. None of these later operations is supported by PR1;
+Java and cross-language live validation remain future work. None of those later operations is supported by PR2;
 raw batch results, full-fidelity/processor/Functions integration and LINQ are not promised.

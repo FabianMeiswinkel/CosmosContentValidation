@@ -1,8 +1,9 @@
-# PR1 console sample and opt-in live tests
+# PR2 console sample and opt-in live tests
 
-These examples cover **point create/read, typed and stream**, plus point deletion of
-acknowledged sample/test creations. No database or container is provisioned or deleted.
-Protected query, replace, upsert, patch, batch, bulk and change feed are not demonstrated.
+These examples cover typed/stream point create/read/replace/upsert, full-document item
+queries and latest-version pull change feed, plus point deletion of acknowledged sample/test
+creations. No database or container is provisioned or deleted.
+Protected patch, batch and bulk are not demonstrated.
 The deliberately unprotected patch client exists only for scoped tamper tests.
 
 ## Sample-only providers and review status
@@ -45,8 +46,8 @@ keys **only in process**, then exercises the library serializer and sample-only 
 Offline success exits 0. The larger offline unit suite remains in its existing project;
 the console checks do not replace it. Live tests are discovered but **skipped** unless
 the exact environment value `COSMOS_RUN_LIVE_TESTS=1` is set. Any other value skips.
-Consult the [latest recorded validation evidence](pr1-validation.md) for executed results.
-Earlier runs do not verify the newly added guard tests or updated architecture tests; this guide makes no new pass claim.
+Consult the [latest recorded validation evidence](pr2-validation.md) for executed results.
+That report records offline validation only; live Azure execution remains pending explicit opt-in and external configuration.
 
 ## Online prerequisites and configuration
 
@@ -126,15 +127,22 @@ dotnet test ./dotnet/tests/CosmosContentValidation.LiveTests --no-restore --logg
 ```
 
 The sample defaults to Gateway; `--direct` selects Direct and may be combined with
-`--tamper`. It creates two new items, one typed and one stream, and reads each through
-the public-only reader using both APIs. Output reports action outcomes, not documents,
+`--tamper`. It creates/upserts three new items across logical partitions, performs typed
+and stream ETag-conditional replacements and upsert updates, and reads each through
+the public-only reader. Status-only writes are followed by protected readback. It then
+executes scalar/object-parameter full-document queries, cross-partition one-item pages,
+fresh-iterator continuation resume, exact stream envelopes and typed/stream latest-version
+pull feed from pre-write NOW checkpoints. Output reports action outcomes, not documents,
 keys, endpoints or full credential/SDK exception text. Typed examples access the native
 `ItemResponse<T>.Resource`; a status code alone is not a content-validation claim.
 Stream examples consume then rewind the actual response body before disposing the
 `ResponseMessage` that owns it. Caller payloads stay alive through awaited writes.
 Separate clients forward session tokens to avoid stale reads after creates/patches.
+Change-feed polling is bounded to 30 seconds, handles empty/304 pages, and advances its
+local checkpoint only after a page is successfully validated and processed. This is not
+a completeness, freshness, intermediate-version or delete guarantee.
 
-`--tamper` additionally changes `/value` on **only these two acknowledged new items**
+`--tamper` additionally changes `/value` on **only these acknowledged new items**
 through the raw client. Both typed and stream signed reads must reject `InvalidSignature`.
 Without `--tamper`, no online patch is issued by the console. Offline mode already tests
 local tampering and must be used alone. Nothing is re-signed to hide deliberate tampering.
@@ -146,7 +154,10 @@ successes. A failed startup key-match probe is a configuration failure, not an A
 
 ## Live coverage
 
-The live project has six custom theories and **24 rows**, covering Direct and Gateway:
+The live project has nine custom theories and **30 enabled rows**, covering Direct and Gateway.
+Both test classes share a nonparallel collection as defense in depth for the dedicated live container.
+PR2 feed checkpoints are additionally scoped to test-owned logical partitions so unrelated documents
+cannot enter a page that must be entirely verifiable under the active fixture key.
 
 | Scenario | Rows |
 | --- | ---: |
@@ -156,6 +167,9 @@ The live project has six custom theories and **24 rows**, covering Direct and Ga
 | Custom policy permits root-field add/remove/change after typed or stream create | 4 |
 | Custom policy still protects nested and case-variant names | 8 |
 | Public-only typed and stream writes reject `SigningUnavailable` | 2 |
+| ETag replace, stale precondition, upsert insert/update and status-only readback | 2 |
+| Scalar/object-parameter typed/stream queries, cross-partition pages and resume | 2 |
+| Typed/stream latest-version pull feed with NOW checkpoint and bounded polling | 2 |
 
 Checks include 201/200 statuses, activity ID, request charge, ETag/session headers,
 materialized service metadata, envelope retention/stripping, explicit public-only
@@ -169,7 +183,7 @@ skipped tests perform no credential acquisition or Azure operations.
 The protected `Container.Scripts` getter rejects access before touching the underlying delegate, covering
 typed `ExecuteStoredProcedureAsync<T>` and both `ExecuteStoredProcedureStreamAsync` overloads.
 All writes with nonempty `PreTriggers` or `PostTriggers` are rejected before reading content or submitting a request:
-typed/stream create and delete now, replace/upsert when PR2 implements them. Empty lists request no invocation and are copied
+typed/stream create, replace, upsert and delete. Empty lists request no invocation and are copied
 before input is read. `SnapshotOptions` defaults `isWrite` to `true`; typed/stream reads pass `false` and retain ordinary option
 handling and detached list copies, without a write-trigger guard. Patch stays blocked even for ignored fields.
 
@@ -179,7 +193,7 @@ and `TriggerGuardIsWriteOnlyAndReadOptionsAreCopied` in [CosmosWrapperTests](../
 [ArchitectureTests](../dotnet/tests/CosmosContentValidation.Tests/ArchitectureTests.cs) checks provider placement and direct dependency/emitted assembly boundaries;
 [ProcessorTests](../dotnet/tests/CosmosContentValidation.Tests/ProcessorTests.cs) covers constructor contracts, whole-input validation and policy-provider delegation.
 These are coverage descriptions, not newly verified results or security approval.
-PR2–PR5 must carry the provider boundary and execution guards forward, including equivalent Java tests; those PRs are not implemented here.
+PR3–PR5 must carry the provider boundary and execution guards forward, including equivalent Java tests; those PRs are not implemented here.
 
 Direct mode requires the account's data-plane network connectivity, not just HTTPS
 gateway access. Accounts must support the explicitly requested Session consistency;
@@ -202,8 +216,8 @@ not console key files or `CONTENT_IGNORED_PROPERTIES`.
   not retried unconditionally.
   Cleanup failures do not replace the original operation failure; cleanup-only failures
   produce a failing result. Already absent items count as cleaned.
-- No queries, partition-wide deletion, database/container provisioning or resource
-  deletion occur. Each live row budgets at most two identities. Main work is bounded to
+- No partition-wide deletion, database/container provisioning or resource deletion occurs.
+  Queries select only generated GUID identities; pull feed starts from NOW and is scoped to a generated logical partition. Each live row budgets at most two identities. Main work is bounded to
   two minutes; cleanup has a fresh 20-second budget per confirmed item. Rate-limit retries
   are disabled. Tests still consume request units, including metadata reads and failures.
 - Items begin with `ttl=-1`; TTL mutations use 86400, avoiding short accidental expiry.

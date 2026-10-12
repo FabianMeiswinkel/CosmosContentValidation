@@ -2,9 +2,9 @@
 
 - **Date:** 2026-10-12
 - **Status:** Approved plan, updated requirements: configurable ignored root properties, sample-only `Unsafe` providers, and explicit stored-procedure/write-trigger execution boundaries.
-- **Delivery:** PR1 foundation implemented; prior offline verification is recorded in the [latest validation report](pr1-validation.md). Provider-refactor and newly added guard-test results must be verified and recorded separately; no new pass claim is made here. Live Azure verification, future security-team provider validation/replacement and user review remain pending. PR2–PR5 not started.
+- **Delivery:** PR1 is committed and PR2 is implemented in the working tree. Current PR2 offline evidence is recorded in [pr2-validation.md](pr2-validation.md). Live Azure verification, future security-team provider validation/replacement and user review remain pending. PR3–PR5 are not started.
 - **Sequence:** PR1 → PR2 → PR3 → PR4 → PR5; finish .NET before Java. Parallel work is permitted only within a PR after its interface prerequisites.
-- **Implementation scope:** PR1 only. SDK source and PR2–PR5 remain unchanged. Builds and verification are recorded separately from human interface/wire-format approval.
+- **Implementation scope:** PR2 only: .NET lifecycle updates, guarded item queries and latest-version pull change feed. SDK source and PR3–PR5 remain unchanged. Builds and verification are recorded separately from human interface/wire-format approval.
 - **Baseline:** Repository initially contains README, MIT license, ignore rules, and Git metadata on `main`; no application/build/CI scaffolding. Commits, pushes, and starting subsequent PRs remain subject to the normal user workflow.
 
 ## 1. Scope and approved decisions
@@ -109,7 +109,7 @@ Run offline tests for each PR and explicitly opted-in live Azure integration tes
 - .NET stored-procedure execution must fail at the `Container.Scripts` getter **before inner scripts delegate access**, covering `ExecuteStoredProcedureAsync<T>` and both `ExecuteStoredProcedureStreamAsync` overloads (object-array parameters or stream payload). This blocks execution, not merely script management.
 - `SnapshotOptions(ItemRequestOptions, bool isWrite = true)` copies trigger lists before checking them. Create/delete use the write default and reject nonempty `PreTriggers`/`PostTriggers` before reading content or dispatching; empty lists request no invocation and remain detached. `ReadItemAsync<T>`/`ReadItemStreamAsync` pass `isWrite: false`, retaining normal option validation/copying without the write-trigger guard. Extend the write rule to replace/upsert and applicable bulk/batch options, and port equivalent semantics to Java; never exempt ignored-field Patch.
 - Use ordinary parameter serialization with public `QueryDefinition.WithParameterStream` so parameters are not signed a second time [S04]. Preserve originals and parameter/literal semantics.
-- SQL guard: accept a case-insensitive `SELECT * FROM` token prefix with leading/inter-token whitespace and proper boundaries; reject null/empty SQL, leading comments, projections, `VALUE`, and `DISTINCT`/`TOP` prefix forms. Never strip whitespace inside literals. This is not a full SQL parser: nested sources/subqueries can still yield invalid content, which must fail signature validation.
+- SQL guard: accept case-insensitive `SELECT * FROM <root>` with leading/inter-token ASCII whitespace, an optional ordinary alias and proper boundaries; reject null/empty SQL, leading comments, projections, `VALUE`, `DISTINCT`/`TOP`, nested `FROM` sources, collection `IN`, joins and comma sources before delegation. Never rewrite SQL or literals. This is not a full SQL parser; every returned raw document still requires signature validation.
 - Java `CosmosItemSerializer` synchronously converts objects/maps; public `DEFAULT_SERIALIZER`, client registration and per-request overrides exist [S05]. Deep-copy SDK-owned maps before mutation.
 - Java `CosmosAsyncContainer` has a protected wrapping constructor; relevant overloads need explicit review because forwarding is not uniform [S06]. Its operation policy cannot reliably inspect original SQL: diagnostics construction supplies a null query statement. Guard original arguments; `CosmosOperationDetails` exposes context/diagnostics and `setRequestOptions`, not public `getRequestOptions`. No telemetry workaround.
 - Java point `getItem()` is lazy; raw `String`/`byte[]` targets bypass custom deserialization. POJO/Map/JsonNode paths through `Utils.parse` invoke it [S07]. Preserve native responses but state validation timing and raw-access limitations.
@@ -135,7 +135,7 @@ Run offline tests for each PR and explicitly opted-in live Azure integration tes
 - [ ] **P1.8** Test crypto ordering/digest lengths, metadata/custom exclusions, malformed/missing signatures, keys/profiles, reserved collisions, concurrency/no-mutation; stream seekability/chunking/current position/offset/growth/disposal/errors/cancellation; sample-only provider/direct-dependency/emitted-assembly architecture; explicit injection, whole-input validation and policy-provider calls; every stored-procedure overload, write-trigger pre-read/pre-submit rejection, empty-list snapshots and read-only guard exemption; live create/read, service metadata and tampering. **REQ-002–009, REQ-016–017, REQ-019**
 
 P1.1 specifications and public interfaces are implemented, awaiting user review and future security-team provider validation/replacement.
-Use the [latest validation report](pr1-validation.md) for executed test counts, packaging and offline-console results rather than treating an older baseline count as current.
+Use the [latest validation report](pr2-validation.md) for current test counts, packaging and offline-console results; [pr1-validation.md](pr1-validation.md) remains historical PR1 evidence.
 The new wrapper tests `EveryStoredProcedureExecutionOverloadIsRejectedAtContainerBoundary`, `WriteTriggerExecutionIsRejectedBeforeContentReadOrSubmission`,
 `EmptyWriteTriggerListsAreAllowedAndSnapshottedBeforeInputIsRead` and `TriggerGuardIsWriteOnlyAndReadOptionsAreCopied` are present in
 [CosmosWrapperTests](../dotnet/tests/CosmosContentValidation.Tests/CosmosWrapperTests.cs); architecture tests are updated in
@@ -145,15 +145,15 @@ Six live theory groups (24 enabled Direct/Gateway cases) require external Azure 
 
 ### PR2 — .NET lifecycle, queries, latest-version change feed
 
-**Status:** Not started. **Depends on:** PR1. Query/feed work may run in parallel after serializer/buffer completion.
+**Status:** Implemented; offline validation passed. Live Azure execution, security-team provider validation/replacement and user review remain pending. **Depends on:** PR1.
 
 Carry REQ-019's sample-only provider boundary and REQ-016's stored-procedure/write-trigger guards forward; adding APIs must not add library provider defaults.
 
-- [ ] **P2.1** Enable typed/stream replace/upsert insert+update, ETag conditional replace, response content on/off; reject nonempty pre/post-trigger lists before input read/signing/submission, snapshot empty lists, verify returned bodies and demonstrate readback for status-only writes. **REQ-007, REQ-009–010, REQ-016, REQ-019**
-- [ ] **P2.2** Guard every query overload before delegation. Clone definitions/parameters as needed and use ordinary serialization plus `WithParameterStream`, including object parameters containing `id`; leave caller SQL/literals/options intact. **REQ-011, REQ-016**
-- [ ] **P2.3** Add typed/stream full-document WHERE/ORDER BY, single/cross-partition, empty-page and continuation-resume examples. Stream paths inspect service envelopes; typed arrays verify every item. Invalid content fails materialization rather than being skipped. **REQ-007, REQ-009, REQ-011, REQ-018**
-- [ ] **P2.4** Add `GetChangeFeedIterator`/`GetChangeFeedStreamIterator` latest-version pull examples with bounded polling, resume and empty/304 handling. Checkpoint only after processing a valid page; no all-versions/delete guarantee. **REQ-009, REQ-012, REQ-018**
-- [ ] **P2.5** Test guards before submission, including zero-result projections, all stored-procedure entry points and nonempty triggers on every write. Cover empty-list snapshot mutation and reads retaining ordinary options without the write guard; preserve provider-architecture checks. Test later-page query/feed tampering or missing signatures, retry replay, cancellation and preserved errors. Keep Patch (even ignored targets), LINQ/full-fidelity/processor integration explicitly unsupported. **REQ-007, REQ-009–012, REQ-016–017, REQ-019**
+- [x] **P2.1** Enable typed/stream replace/upsert insert+update, ETag conditional replace, response content on/off; reject nonempty pre/post-trigger lists before input read/signing/submission, snapshot empty lists, verify returned bodies and demonstrate readback for status-only writes. **REQ-007, REQ-009–010, REQ-016, REQ-019**
+- [x] **P2.2** Guard every query overload before delegation. Rebuild definitions/parameters through `ContentValidationQueryDefinition` and ordinary serialization plus `WithParameterStream`, including object parameters containing `id`; leave caller SQL/literals/options intact. Native parameterless definitions remain accepted; opaque native parameterized definitions fail closed. **REQ-011, REQ-016**
+- [x] **P2.3** Add typed/stream full-document WHERE/ORDER BY, single/cross-partition, empty-page and continuation-resume examples. Stream paths inspect service envelopes; typed arrays verify every item. Invalid content fails materialization rather than being skipped. **REQ-007, REQ-009, REQ-011, REQ-018**
+- [x] **P2.4** Add `GetChangeFeedIterator`/`GetChangeFeedStreamIterator` latest-version pull examples with bounded polling, resume and empty/304 handling. Checkpoint only after processing a valid page; no all-versions/delete guarantee. **REQ-009, REQ-012, REQ-018**
+- [x] **P2.5** Test guards before submission, including zero-result projections, all stored-procedure entry points and nonempty triggers on every write. Cover empty-list snapshot mutation and reads retaining ordinary options without the write guard; preserve provider-architecture checks. Test page tampering/missing signatures, retry replay, cancellation and preserved errors. Keep Patch (even ignored targets), LINQ/full-fidelity/processor integration explicitly unsupported. **REQ-007, REQ-009–012, REQ-016–017, REQ-019**
 
 ### PR3 — .NET native bulk and transactional batch
 
@@ -192,7 +192,7 @@ Retain REQ-019's sample-only `Unsafe` implementations, required injection and fu
 
 ## 8. Verification and security boundaries
 
-- Each PR must independently build, test and package its available library/console: .NET build/test, Maven verify, and explicit live profile after scaffolding. Only the [validation report](pr1-validation.md) records executed PR1 results; this updated plan makes no pass claim for new changes or future PRs.
+- Each PR must independently build, test and package its available library/console: .NET build/test, Maven verify, and explicit live profile after scaffolding. The [PR2 validation report](pr2-validation.md) records current offline results; it makes no live-Azure, review or future-PR claim.
 - Offline tests cover stage ordering, wrong digest length/double hashing, default/custom root versus nested exclusions, policy mismatch, missing/invalid signature, unknown profile/key, arrays/null/missing, escaped names/property ordering, safe-number boundaries, invalid input, concurrency, mutation and I/O-free providers.
 - Stream tests prove readability after validation, restored seekable positions, non-seekable replacement replay, response/error metadata preservation, cancellation, no use-after-return/double-return/finalizer reliance/shared cursors, and no extra `ToArray`/repeated flattening. Include pool concurrency/memory-growth tests and non-brittle allocation benchmarks.
 - Guard tests must prove rejection **before content read/signing/enqueue/submission**, including every stored-procedure execution overload before delegate access, nonempty pre/post triggers on all writes, zero-result projections and remove-only/ignored-target Patch in bulk/batch. Empty trigger lists must be detached before input consumption; reads keep ordinary option checks/copies without write-trigger rejection. Startup metadata network calls are distinct from submitting a content operation.
@@ -242,4 +242,4 @@ including canonicalization/input acceptance, hashing, key import/resolution, sig
 ownership, the synchronous no-I/O contract, fixed v1 wire identifiers/prehash semantics, delegated policy identity, exclusions and signature metadata binding.
 Review every stored-procedure execution entry point, write-trigger snapshot/check ordering, the read-only exemption and ignored-field Patch rejection.
 Keep direct library dependency/emitted-reference checks distinct from transitive transport/auth crypto. These gates apply to Java as well;
-PR2–PR5 remain not started. Guards, security tests and fail-closed behavior are prerequisites in every relevant PR, never deferred to final hardening.
+PR2 is implemented with offline evidence recorded separately; PR3–PR5 remain not started. Guards, security tests and fail-closed behavior are prerequisites in every relevant PR, never deferred to final hardening.

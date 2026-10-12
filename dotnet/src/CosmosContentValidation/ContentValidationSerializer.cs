@@ -9,7 +9,7 @@ namespace CosmosContentValidation;
 /// Use together with the guarded client. Raw SDK stream APIs bypass this hook. ToStream output
 /// belongs to the SDK. FromStream owns its input (including on failure). An injected ordinary
 /// serializer is caller-owned, must be thread safe, and must not perform I/O or content protection.
-/// Query parameters are not documents: query integration is reserved for PR2.
+/// Query parameters are not documents: the guarded query builder uses the ordinary delegate.
 /// </remarks>
 public sealed class ContentValidationSerializer : CosmosSerializer
 {
@@ -64,6 +64,9 @@ public sealed class ContentValidationSerializer : CosmosSerializer
             return Materialize<T>(buffered);
         }
     }
+
+    /// <summary>Serializes a query parameter through the ordinary delegate without signing it.</summary>
+    internal Stream SerializeUnprotectedParameter(object? value) => inner.ToStream(value);
 
     private T Materialize<T>(RecyclableMemoryStream source)
     {

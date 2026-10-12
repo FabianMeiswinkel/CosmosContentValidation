@@ -124,13 +124,18 @@ public sealed class CosmosWrapperTests
     public void SdkOwnedGenericTargetsRejectBeforeEveryInnerItemCall(Type target)
     {
         using Harness h = new();
-        foreach (string operation in new[] { "CreateItemAsync", "ReadItemAsync", "DeleteItemAsync" })
+        foreach (string operation in new[] { "CreateItemAsync", "UpsertItemAsync", "ReplaceItemAsync", "ReadItemAsync", "DeleteItemAsync" })
         {
             MethodInfo method = typeof(Container).GetMethods().Single(method => method.Name == operation).MakeGenericMethod(target);
             // Some DTOs have no public constructor. Their state must never be inspected:
             // rejection depends on the generic target and must precede any inner submission.
             object item = System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(target);
-            object?[] arguments = [operation == "CreateItemAsync" ? item : "one", Pk, null, CancellationToken.None];
+            object?[] arguments = operation switch
+            {
+                "CreateItemAsync" or "UpsertItemAsync" => [item, Pk, null, CancellationToken.None],
+                "ReplaceItemAsync" => [item, "one", Pk, null, CancellationToken.None],
+                _ => ["one", Pk, null, CancellationToken.None]
+            };
             TargetInvocationException failure = Assert.Throws<TargetInvocationException>(() => method.Invoke(h.Container, arguments));
             Assert.IsType<NotSupportedException>(failure.InnerException);
             Assert.Equal(0, h.Inner.Calls);
@@ -250,10 +255,86 @@ public sealed class CosmosWrapperTests
     {
         using Harness h = new();
         await AssertBlockedSurface(h.Container, typeof(Container),
-            ["get_Id", "get_Database", "CreateItemAsync", "ReadItemAsync", "DeleteItemAsync", "CreateItemStreamAsync", "ReadItemStreamAsync", "DeleteItemStreamAsync"]);
+            ["get_Id", "get_Database", "CreateItemAsync", "UpsertItemAsync", "ReplaceItemAsync", "ReadItemAsync", "DeleteItemAsync",
+                "CreateItemStreamAsync", "UpsertItemStreamAsync", "ReplaceItemStreamAsync", "ReadItemStreamAsync", "DeleteItemStreamAsync",
+                "GetItemQueryIterator", "GetItemQueryStreamIterator", "GetChangeFeedIterator", "GetChangeFeedStreamIterator"]);
         await AssertBlockedSurface(h.Database, typeof(Database), ["get_Id", "get_Client", "GetContainer"]);
         await AssertBlockedSurface(h.Client, typeof(CosmosClient), ["get_Endpoint", "get_ClientOptions", "get_ResponseFactory", "ReadAccountAsync", "GetDatabase", "GetContainer", "Dispose"]);
         Assert.Equal(0, h.Inner.Calls);
+    }
+
+    [Fact]
+    public void QueryOverloadsGuardBeforeDelegationAndUseStreamValidationWrappers()
+    {
+        using Harness h = new();
+        QueryRequestOptions options = new() { MaxItemCount = 2, ExcludeRegions = [Regions.EastUS] };
+        ContentValidationQueryDefinition guarded = new ContentValidationQueryDefinition("SELECT * FROM c WHERE c.pk = @pk")
+            .WithParameter("@pk", "p");
+
+        using FeedIterator<JsonElement> typed = h.Container.GetItemQueryIterator<JsonElement>(guarded, "typed-token", options);
+        Assert.IsType<ContentValidationFeedIterator<JsonElement>>(typed);
+        Assert.Equal("SELECT * FROM c WHERE c.pk = @pk", h.Inner.LastQuery!.QueryText);
+        Assert.Single(h.Inner.LastQuery.GetQueryParameters());
+        Assert.Equal("typed-token", h.Inner.LastContinuation);
+        Assert.NotSame(options, h.Inner.LastQueryOptions);
+        Assert.Equal(2, h.Inner.LastQueryOptions!.MaxItemCount);
+        options.ExcludeRegions.Add(Regions.WestUS);
+        Assert.Equal([Regions.EastUS], h.Inner.LastQueryOptions.ExcludeRegions);
+
+        using FeedIterator stream = h.Container.GetItemQueryStreamIterator("SELECT * FROM c ORDER BY c.id", "stream-token");
+        Assert.IsType<ContentValidationFeedIterator>(stream);
+        Assert.Equal("stream-token", h.Inner.LastContinuation);
+
+        FeedRange range = FeedRange.FromPartitionKey(Pk);
+        using FeedIterator<JsonElement> rangedTyped = h.Container.GetItemQueryIterator<JsonElement>(range,
+            new QueryDefinition("SELECT * FROM c"));
+        using FeedIterator rangedStream = h.Container.GetItemQueryStreamIterator(range,
+            new QueryDefinition("SELECT * FROM c"));
+        Assert.Equal(4, h.Inner.StreamQueryCalls);
+        Assert.Equal(4, h.Inner.Calls);
+
+        foreach (Action rejected in new Action[]
+        {
+            () => h.Container.GetItemQueryIterator<JsonElement>("SELECT VALUE c.id FROM c"),
+            () => h.Container.GetItemQueryStreamIterator("SELECT * FROMRoot c"),
+            () => h.Container.GetItemQueryStreamIterator((string?)null),
+            () => h.Container.GetItemQueryStreamIterator(new QueryDefinition("SELECT * FROM c").WithParameter("@pk", "p")),
+            () => h.Container.GetItemQueryIterator<DatabaseProperties>("SELECT * FROM c")
+        })
+        {
+            Assert.ThrowsAny<Exception>(rejected);
+        }
+        Assert.Equal(4, h.Inner.Calls);
+    }
+
+    [Fact]
+    public void LatestVersionChangeFeedIsWrappedAndUnsupportedModesFailBeforeDelegation()
+    {
+        using Harness h = new();
+        List<string> regions = [Regions.EastUS];
+        ChangeFeedRequestOptions options = new() { PageSizeHint = 3, ExcludeRegions = regions };
+        ChangeFeedStartFrom start = ChangeFeedStartFrom.ContinuationToken("resume");
+
+        using FeedIterator<JsonElement> typed = h.Container.GetChangeFeedIterator<JsonElement>(
+            start, ChangeFeedMode.Incremental, options);
+        Assert.IsType<ContentValidationFeedIterator<JsonElement>>(typed);
+        Assert.Same(start, h.Inner.LastChangeFeedStart);
+        Assert.Same(ChangeFeedMode.LatestVersion, h.Inner.LastChangeFeedMode);
+        Assert.NotSame(options, h.Inner.LastChangeFeedOptions);
+        regions.Add(Regions.WestUS);
+        Assert.Equal([Regions.EastUS], h.Inner.LastChangeFeedOptions!.ExcludeRegions);
+
+        using FeedIterator stream = h.Container.GetChangeFeedStreamIterator(
+            ChangeFeedStartFrom.Now(), ChangeFeedMode.LatestVersion);
+        Assert.IsType<ContentValidationFeedIterator>(stream);
+        Assert.Equal(2, h.Inner.ChangeFeedCalls);
+        Assert.Equal(2, h.Inner.Calls);
+
+        Assert.Throws<ContentValidationException>(() => h.Container.GetChangeFeedStreamIterator(
+            ChangeFeedStartFrom.Beginning(), ChangeFeedMode.AllVersionsAndDeletes));
+        Assert.Throws<NotSupportedException>(() => h.Container.GetChangeFeedIterator<DatabaseProperties>(
+            ChangeFeedStartFrom.Now(), ChangeFeedMode.LatestVersion));
+        Assert.Equal(2, h.Inner.Calls);
     }
 
     private static async Task AssertBlockedSurface(object wrapper, Type sdkType, string[] permitted)
@@ -299,6 +380,63 @@ public sealed class CosmosWrapperTests
     }
 
     [Fact]
+    public async Task TypedUpsertInsertModifyAndReplaceSignOnceAndPreserveStatusAndEtagSnapshot()
+    {
+        using Harness h = new();
+        ItemResponse<JsonElement> inserted = await h.Container.UpsertItemAsync(
+            JsonSerializer.Deserialize<JsonElement>("{\"id\":\"one\",\"pk\":\"p\",\"value\":1}"), Pk);
+        Assert.Equal(HttpStatusCode.Created, inserted.StatusCode);
+        Assert.Equal(1, h.Inner.TypedUpserts);
+        Assert.Equal(1, h.Signer.Calls);
+
+        ItemResponse<JsonElement> modified = await h.Container.UpsertItemAsync(
+            JsonSerializer.Deserialize<JsonElement>("{\"id\":\"one\",\"pk\":\"p\",\"value\":2}"), Pk);
+        Assert.Equal(HttpStatusCode.OK, modified.StatusCode);
+        Assert.Equal(2, modified.Resource.GetProperty("value").GetInt32());
+        Assert.Equal(2, h.Signer.Calls);
+
+        ItemRequestOptions options = new()
+        {
+            IfMatchEtag = "expected-etag", EnableContentResponseOnWrite = true,
+            PreTriggers = [], PostTriggers = []
+        };
+        ItemResponse<JsonElement> replaced = await h.Container.ReplaceItemAsync(
+            JsonSerializer.Deserialize<JsonElement>("{\"id\":\"one\",\"pk\":\"p\",\"value\":3}"), "one", Pk, options);
+        Assert.Equal(HttpStatusCode.OK, replaced.StatusCode);
+        Assert.Equal(1, h.Inner.TypedReplaces);
+        Assert.Equal(3, h.Signer.Calls);
+        ItemRequestOptions snapshot = Assert.IsType<ItemRequestOptions>(h.Inner.LastOptions);
+        Assert.NotSame(options, snapshot);
+        Assert.Equal("expected-etag", snapshot.IfMatchEtag);
+        Assert.Empty(snapshot.PreTriggers!);
+        Assert.Empty(snapshot.PostTriggers!);
+
+        ItemResponse<JsonElement> read = await h.Container.ReadItemAsync<JsonElement>("one", Pk);
+        Assert.Equal(3, read.Resource.GetProperty("value").GetInt32());
+        Assert.Equal(3, h.Signer.Calls);
+    }
+
+    [Theory]
+    [InlineData("upsert")]
+    [InlineData("replace")]
+    public async Task InvalidTypedWriteResponseFailsAfterStoredUpdate(string operation)
+    {
+        using Harness h = new();
+        if (operation == "replace")
+            _ = await h.Container.CreateItemAsync(new { id = "one", pk = "p", value = 1 }, Pk);
+        h.Inner.TypedWriteResponseOverride = Document;
+        Func<Task> write = operation == "upsert"
+            ? () => h.Container.UpsertItemAsync(new { id = "one", pk = "p", value = 9 }, Pk)
+            : () => h.Container.ReplaceItemAsync(new { id = "one", pk = "p", value = 9 }, "one", Pk);
+        ContentValidationException failure = await Assert.ThrowsAsync<ContentValidationException>(write);
+        Assert.Equal(ContentValidationFailure.MissingSignature, failure.Failure);
+        h.Inner.TypedWriteResponseOverride = null;
+        ItemResponse<JsonElement> committed = await h.Container.ReadItemAsync<JsonElement>("one", Pk);
+        Assert.Equal(9, committed.Resource.GetProperty("value").GetInt32());
+        Assert.Equal(0, h.Processor.Buffers.InUseBytes);
+    }
+
+    [Fact]
     public async Task TypedEmptySuccessFailsClosedButContentOffAndDeleteRemainAllowed()
     {
         using Harness h = new();
@@ -336,10 +474,20 @@ public sealed class CosmosWrapperTests
         using TrackingStream input = new(Document);
         ContentValidationException typedFailure = await Assert.ThrowsAsync<ContentValidationException>(() => reader.Container.CreateItemAsync(new { id = "one", pk = "p" }, Pk));
         ContentValidationException streamFailure = await Assert.ThrowsAsync<ContentValidationException>(() => reader.Container.CreateItemStreamAsync(input, Pk));
+        ContentValidationException typedUpsert = await Assert.ThrowsAsync<ContentValidationException>(() => reader.Container.UpsertItemAsync(new { id = "one", pk = "p" }, Pk));
+        ContentValidationException typedReplace = await Assert.ThrowsAsync<ContentValidationException>(() => reader.Container.ReplaceItemAsync(new { id = "one", pk = "p" }, "one", Pk));
+        ContentValidationException streamUpsert = await Assert.ThrowsAsync<ContentValidationException>(() => reader.Container.UpsertItemStreamAsync(input, Pk));
+        ContentValidationException streamReplace = await Assert.ThrowsAsync<ContentValidationException>(() => reader.Container.ReplaceItemStreamAsync(input, "one", Pk));
         Assert.Equal(ContentValidationFailure.SigningUnavailable, typedFailure.Failure);
         Assert.Equal(ContentValidationFailure.SigningUnavailable, streamFailure.Failure);
+        Assert.Equal(ContentValidationFailure.SigningUnavailable, typedUpsert.Failure);
+        Assert.Equal(ContentValidationFailure.SigningUnavailable, typedReplace.Failure);
+        Assert.Equal(ContentValidationFailure.SigningUnavailable, streamUpsert.Failure);
+        Assert.Equal(ContentValidationFailure.SigningUnavailable, streamReplace.Failure);
         Assert.Equal(0, input.ReadCalls);
         Assert.Equal(0, reader.Inner.StreamCreates);
+        Assert.Equal(0, reader.Inner.StreamUpserts);
+        Assert.Equal(0, reader.Inner.StreamReplaces);
         using ResponseMessage deleted = await reader.Container.DeleteItemStreamAsync("one", Pk);
         Assert.Equal(HttpStatusCode.NoContent, deleted.StatusCode);
         Assert.Equal(HttpStatusCode.NoContent, (await reader.Container.DeleteItemAsync<JsonElement>("one", Pk)).StatusCode);
@@ -350,11 +498,20 @@ public sealed class CosmosWrapperTests
     {
         using Harness h = new();
         await Assert.ThrowsAsync<ArgumentException>(() => h.Container.CreateItemAsync(new { id = "one", pk = "p" }));
+        await Assert.ThrowsAsync<ArgumentException>(() => h.Container.UpsertItemAsync(new { id = "one", pk = "p" }));
+        await Assert.ThrowsAsync<ArgumentException>(() => h.Container.ReplaceItemAsync(new { id = "one", pk = "p" }, "one"));
+        await Assert.ThrowsAsync<ArgumentException>(() => h.Container.ReplaceItemAsync(new { id = "one", pk = "p" }, "", Pk));
+        await Assert.ThrowsAsync<ArgumentNullException>(() => h.Container.ReplaceItemAsync(new { id = "one", pk = "p" }, null!, Pk));
         await Assert.ThrowsAsync<NotSupportedException>(() => h.Container.ReadItemAsync<Stream>("one", Pk));
         await Assert.ThrowsAsync<NotSupportedException>(() => h.Container.ReadItemAsync<MemoryStream>("one", Pk));
         await Assert.ThrowsAsync<NotSupportedException>(() => h.Container.DeleteItemAsync<Stream>("one", Pk));
         using TrackingStream stream = new(Document);
         await Assert.ThrowsAsync<NotSupportedException>(() => h.Container.CreateItemAsync<object>(stream, Pk));
+        await Assert.ThrowsAsync<NotSupportedException>(() => h.Container.UpsertItemAsync<object>(stream, Pk));
+        await Assert.ThrowsAsync<NotSupportedException>(() => h.Container.ReplaceItemAsync<object>(stream, "one", Pk));
+        await Assert.ThrowsAsync<ArgumentException>(() => h.Container.ReplaceItemStreamAsync(stream, "", Pk));
+        await Assert.ThrowsAsync<ArgumentNullException>(() => h.Container.ReplaceItemStreamAsync(stream, null!, Pk));
+        Assert.Equal(0, stream.ReadCalls);
         Assert.Equal(0, h.Inner.Calls);
     }
 
@@ -371,9 +528,13 @@ public sealed class CosmosWrapperTests
         {
             using TrackingStream stream = new(Document);
             await Assert.ThrowsAsync<NotSupportedException>(() => h.Container.CreateItemAsync(new { id = "one", pk = "p" }, Pk, options));
+            await Assert.ThrowsAsync<NotSupportedException>(() => h.Container.UpsertItemAsync(new { id = "one", pk = "p" }, Pk, options));
+            await Assert.ThrowsAsync<NotSupportedException>(() => h.Container.ReplaceItemAsync(new { id = "one", pk = "p" }, "one", Pk, options));
             await Assert.ThrowsAsync<NotSupportedException>(() => h.Container.ReadItemAsync<JsonElement>("one", Pk, options));
             await Assert.ThrowsAsync<NotSupportedException>(() => h.Container.DeleteItemAsync<JsonElement>("one", Pk, options));
             await Assert.ThrowsAsync<NotSupportedException>(() => h.Container.CreateItemStreamAsync(stream, Pk, options));
+            await Assert.ThrowsAsync<NotSupportedException>(() => h.Container.UpsertItemStreamAsync(stream, Pk, options));
+            await Assert.ThrowsAsync<NotSupportedException>(() => h.Container.ReplaceItemStreamAsync(stream, "one", Pk, options));
             await Assert.ThrowsAsync<NotSupportedException>(() => h.Container.ReadItemStreamAsync("one", Pk, options));
             await Assert.ThrowsAsync<NotSupportedException>(() => h.Container.DeleteItemStreamAsync("one", Pk, options));
             Assert.Equal(0, stream.ReadCalls);
@@ -393,7 +554,11 @@ public sealed class CosmosWrapperTests
         using TrackingStream source = new(Document);
         Assert.Contains("trigger", (await Assert.ThrowsAsync<NotSupportedException>(() =>
             h.Container.CreateItemAsync(new { id = "one", pk = "p" }, Pk, options))).Message);
+        await Assert.ThrowsAsync<NotSupportedException>(() => h.Container.UpsertItemAsync(new { id = "one", pk = "p" }, Pk, options));
+        await Assert.ThrowsAsync<NotSupportedException>(() => h.Container.ReplaceItemAsync(new { id = "one", pk = "p" }, "one", Pk, options));
         await Assert.ThrowsAsync<NotSupportedException>(() => h.Container.CreateItemStreamAsync(source, Pk, options));
+        await Assert.ThrowsAsync<NotSupportedException>(() => h.Container.UpsertItemStreamAsync(source, Pk, options));
+        await Assert.ThrowsAsync<NotSupportedException>(() => h.Container.ReplaceItemStreamAsync(source, "one", Pk, options));
         await Assert.ThrowsAsync<NotSupportedException>(() => h.Container.DeleteItemAsync<JsonElement>("one", Pk, options));
         await Assert.ThrowsAsync<NotSupportedException>(() => h.Container.DeleteItemStreamAsync("one", Pk, options));
         Assert.Equal(0, source.ReadCalls);
@@ -536,6 +701,121 @@ public sealed class CosmosWrapperTests
         Assert.True(h.Processor.Buffers.InUseBytes > 0);
         response.Dispose();
         Assert.False(returned.CanRead);
+        Assert.Equal(0, h.Processor.Buffers.InUseBytes);
+    }
+
+    [Theory]
+    [InlineData("upsert", true, 201)]
+    [InlineData("upsert", false, 201)]
+    [InlineData("replace", true, 200)]
+    [InlineData("replace", false, 200)]
+    public async Task StreamReplaceAndUpsertSignOnceReplayAcrossRetryAndTransferResponse(string operation, bool seekable, int expectedStatus)
+    {
+        using Harness h = new();
+        using TrackingStream source = new("prefix" + Document, seekable);
+        source.SetInitialPosition(6);
+        RecyclableMemoryStream? outbound = null;
+        Func<Stream, ItemRequestOptions?, CancellationToken, Task<ResponseMessage>> callback = async (body, options, token) =>
+        {
+            outbound = Assert.IsType<RecyclableMemoryStream>(body);
+            Assert.Equal("etag", options!.IfMatchEtag);
+            h.Processor.Validate(outbound.GetReadOnlySequence());
+            using RecyclableMemoryStream first = await h.Processor.Buffers.ReadAsync(body, token);
+            body.Position = 0;
+            using RecyclableMemoryStream retry = await h.Processor.Buffers.ReadAsync(body, token);
+            AssertSequencesEqual(first.GetReadOnlySequence(), retry.GetReadOnlySequence());
+            body.Position = 0;
+            return Response((HttpStatusCode)expectedStatus, h.Processor.Buffers.Read(body));
+        };
+        if (operation == "upsert") h.Inner.OnStreamUpsert = callback;
+        else h.Inner.OnStreamReplace = callback;
+
+        ResponseMessage response = await InvokeStreamWrite(h, operation, source, new ItemRequestOptions { IfMatchEtag = "etag" });
+        Assert.Equal((HttpStatusCode)expectedStatus, response.StatusCode);
+        Assert.Equal(1, h.Signer.Calls);
+        Assert.Equal(operation == "upsert" ? 1 : 0, h.Inner.StreamUpserts);
+        Assert.Equal(operation == "replace" ? 1 : 0, h.Inner.StreamReplaces);
+        Assert.Equal(0, source.DisposeCalls);
+        if (seekable) Assert.Equal(6, source.Position);
+        Assert.False(outbound!.CanRead);
+        RecyclableMemoryStream returned = Assert.IsType<RecyclableMemoryStream>(response.Content);
+        Assert.Equal(0, returned.Position);
+        h.Processor.Validate(returned.GetReadOnlySequence());
+        response.Dispose();
+        Assert.False(returned.CanRead);
+        Assert.Equal(0, h.Processor.Buffers.InUseBytes);
+    }
+
+    [Theory]
+    [InlineData("upsert")]
+    [InlineData("replace")]
+    public async Task StreamUpdateContentOffStillRejectsInvalidNonemptySuccessAndAllowsAbsentBody(string operation)
+    {
+        using Harness h = new();
+        using TrackingStream source = new(Document);
+        TrackingStream invalid = new(Document);
+        TrackingResponse invalidResponse = Response(HttpStatusCode.OK, invalid);
+        if (operation == "upsert") h.Inner.UpsertResponse = invalidResponse;
+        else h.Inner.ReplaceResponse = invalidResponse;
+        ItemRequestOptions options = new() { EnableContentResponseOnWrite = false };
+        await Assert.ThrowsAsync<ContentValidationException>(() => InvokeStreamWrite(h, operation, source, options));
+        Assert.Equal(1, invalidResponse.DisposeCalls);
+        Assert.Equal(1, invalid.DisposeCalls);
+
+        TrackingResponse empty = Response(HttpStatusCode.OK);
+        if (operation == "upsert") h.Inner.UpsertResponse = empty;
+        else h.Inner.ReplaceResponse = empty;
+        using ResponseMessage returned = await InvokeStreamWrite(h, operation, source, options);
+        Assert.Same(empty, returned);
+        Assert.Equal(0, h.Processor.Buffers.InUseBytes);
+    }
+
+    [Theory]
+    [InlineData("upsert")]
+    [InlineData("replace")]
+    public async Task StreamUpdateCancellationAndTransportFailureReleaseAllWriteLeases(string operation)
+    {
+        using Harness h = new();
+        using TrackingStream source = new(Document);
+        using CancellationTokenSource cancellation = new();
+        h.Signer.AfterSign = cancellation.Cancel;
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            InvokeStreamWrite(h, operation, source, cancellationToken: cancellation.Token));
+        Assert.Equal(0, h.Inner.Calls);
+        Assert.Equal(0, h.Processor.Buffers.InUseBytes);
+
+        h.Signer.AfterSign = null;
+        Stream? sent = null;
+        Func<Stream, ItemRequestOptions?, CancellationToken, Task<ResponseMessage>> failure = (body, _, _) =>
+        {
+            sent = body;
+            throw new IOException("transport failed");
+        };
+        if (operation == "upsert") h.Inner.OnStreamUpsert = failure;
+        else h.Inner.OnStreamReplace = failure;
+        await Assert.ThrowsAsync<IOException>(() => InvokeStreamWrite(h, operation, source));
+        Assert.False(sent!.CanRead);
+        Assert.Equal(0, source.Position);
+        Assert.Equal(0, source.DisposeCalls);
+        Assert.Equal(0, h.Processor.Buffers.InUseBytes);
+    }
+
+    [Theory]
+    [InlineData("upsert")]
+    [InlineData("replace")]
+    public async Task InvalidStreamUpdateResponseFailsAfterSubmissionAndReleasesAllBuffers(string operation)
+    {
+        using Harness h = new();
+        using TrackingStream source = new(Document);
+        TrackingStream body = new(Document);
+        TrackingResponse response = Response(HttpStatusCode.OK, body);
+        if (operation == "upsert") h.Inner.UpsertResponse = response;
+        else h.Inner.ReplaceResponse = response;
+        await Assert.ThrowsAsync<ContentValidationException>(() => InvokeStreamWrite(h, operation, source));
+        Assert.Equal(1, operation == "upsert" ? h.Inner.StreamUpserts : h.Inner.StreamReplaces);
+        Assert.Equal(1, response.DisposeCalls);
+        Assert.Equal(1, body.DisposeCalls);
+        Assert.Equal(0, source.DisposeCalls);
         Assert.Equal(0, h.Processor.Buffers.InUseBytes);
     }
 
@@ -877,9 +1157,13 @@ public sealed class CosmosWrapperTests
         using TrackingStream source = new(Document);
         CancellationToken token = cancellation.Token;
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => h.Container.CreateItemStreamAsync(source, Pk, cancellationToken: token));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => h.Container.UpsertItemStreamAsync(source, Pk, cancellationToken: token));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => h.Container.ReplaceItemStreamAsync(source, "one", Pk, cancellationToken: token));
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => h.Container.ReadItemStreamAsync("one", Pk, cancellationToken: token));
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => h.Container.DeleteItemStreamAsync("one", Pk, cancellationToken: token));
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => h.Container.CreateItemAsync(new { id = "one", pk = "p" }, Pk, cancellationToken: token));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => h.Container.UpsertItemAsync(new { id = "one", pk = "p" }, Pk, cancellationToken: token));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => h.Container.ReplaceItemAsync(new { id = "one", pk = "p" }, "one", Pk, cancellationToken: token));
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => h.Container.ReadItemAsync<JsonElement>("one", Pk, cancellationToken: token));
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => h.Container.DeleteItemAsync<JsonElement>("one", Pk, cancellationToken: token));
         Assert.Equal(0, source.ReadCalls);
@@ -957,6 +1241,18 @@ public sealed class CosmosWrapperTests
         Assert.Equal(0, h.Processor.Buffers.InUseBytes);
     }
 
+    private static Task<ResponseMessage> InvokeStreamWrite(
+        Harness harness,
+        string operation,
+        Stream source,
+        ItemRequestOptions? options = null,
+        CancellationToken cancellationToken = default) => operation switch
+    {
+        "upsert" => harness.Container.UpsertItemStreamAsync(source, Pk, options, cancellationToken),
+        "replace" => harness.Container.ReplaceItemStreamAsync(source, "one", Pk, options, cancellationToken),
+        _ => throw new ArgumentOutOfRangeException(nameof(operation))
+    };
+
     private static TrackingResponse Response(HttpStatusCode code, Stream? body = null) => new(code) { Content = body! };
 
     private sealed class Harness : IDisposable
@@ -985,7 +1281,7 @@ public sealed class CosmosWrapperTests
                 new CosmosClientOptions { Serializer = serializer, EnableContentResponseOnWrite = contentResponseOnWrite }),
                 Processor, new CosmosClientOptions { EnableContentResponseOnWrite = contentResponseOnWrite });
             Database = (ContentValidationDatabase)Client.GetDatabase("db");
-            Inner = new FakeContainer(serializer, Processor);
+            Inner = new FakeContainer(serializer);
             Container = new ContentValidationContainer(Database, Inner, Processor, contentResponseOnWrite);
         }
 
@@ -1092,19 +1388,37 @@ public sealed class CosmosWrapperTests
     }
 
     // A handwritten SDK fake: all non-point calls count and fail. No SDK internals or mocking package.
-    private sealed class FakeContainer(CosmosSerializer serializer, ContentValidationProcessor processor) : Container, IDisposable
+    private sealed class FakeContainer(CosmosSerializer serializer) : Container, IDisposable
     {
-        private RecyclableMemoryStream? stored;
+        private MemoryStream? stored;
         public int Calls { get; private set; }
         public int TypedCreates { get; private set; }
+        public int TypedUpserts { get; private set; }
+        public int TypedReplaces { get; private set; }
         public int TypedReads { get; private set; }
         public int StreamCreates { get; private set; }
+        public int StreamUpserts { get; private set; }
+        public int StreamReplaces { get; private set; }
+        public int StreamQueryCalls { get; private set; }
+        public int ChangeFeedCalls { get; private set; }
         public bool EmptyTypedResponse { get; set; }
+        public string? TypedWriteResponseOverride { get; set; }
         public ItemRequestOptions? LastOptions { get; private set; }
+        public string? LastId { get; private set; }
+        public QueryDefinition? LastQuery { get; private set; }
+        public string? LastContinuation { get; private set; }
+        public QueryRequestOptions? LastQueryOptions { get; private set; }
+        public ChangeFeedStartFrom? LastChangeFeedStart { get; private set; }
+        public ChangeFeedMode? LastChangeFeedMode { get; private set; }
+        public ChangeFeedRequestOptions? LastChangeFeedOptions { get; private set; }
         public ResponseMessage? ReadResponse { get; set; }
         public ResponseMessage? CreateResponse { get; set; }
+        public ResponseMessage? UpsertResponse { get; set; }
+        public ResponseMessage? ReplaceResponse { get; set; }
         public ResponseMessage? DeleteResponse { get; set; }
         public Func<Stream, ItemRequestOptions?, CancellationToken, Task<ResponseMessage>>? OnStreamCreate { get; set; }
+        public Func<Stream, ItemRequestOptions?, CancellationToken, Task<ResponseMessage>>? OnStreamUpsert { get; set; }
+        public Func<Stream, ItemRequestOptions?, CancellationToken, Task<ResponseMessage>>? OnStreamReplace { get; set; }
         public override string Id => "items";
         public override Database Database => throw Unexpected();
         public override Conflicts Conflicts => throw Unexpected();
@@ -1113,11 +1427,31 @@ public sealed class CosmosWrapperTests
         public override Task<ItemResponse<T>> CreateItemAsync<T>(T item, PartitionKey? partitionKey = null, ItemRequestOptions? requestOptions = null, CancellationToken cancellationToken = default)
         {
             Calls++; TypedCreates++; LastOptions = requestOptions;
-            if (EmptyTypedResponse) return Task.FromResult<ItemResponse<T>>(new FakeItemResponse<T>(default!, HttpStatusCode.Created));
+            return WriteTyped(item, HttpStatusCode.Created);
+        }
+
+        public override Task<ItemResponse<T>> UpsertItemAsync<T>(T item, PartitionKey? partitionKey = null, ItemRequestOptions? requestOptions = null, CancellationToken cancellationToken = default)
+        {
+            Calls++; TypedUpserts++; LastOptions = requestOptions;
+            HttpStatusCode status = stored is null ? HttpStatusCode.Created : HttpStatusCode.OK;
+            return WriteTyped(item, status);
+        }
+
+        public override Task<ItemResponse<T>> ReplaceItemAsync<T>(T item, string id, PartitionKey? partitionKey = null, ItemRequestOptions? requestOptions = null, CancellationToken cancellationToken = default)
+        {
+            Calls++; TypedReplaces++; LastOptions = requestOptions; LastId = id;
+            return WriteTyped(item, HttpStatusCode.OK);
+        }
+
+        private Task<ItemResponse<T>> WriteTyped<T>(T item, HttpStatusCode status)
+        {
             using Stream wire = serializer.ToStream(item);
-            stored?.Dispose();
-            stored = processor.Buffers.Read(wire);
-            ItemResponse<T> response = new FakeItemResponse<T>(serializer.FromStream<T>(processor.Buffers.Read(stored)), HttpStatusCode.Created);
+            Store(wire);
+            if (EmptyTypedResponse) return Task.FromResult<ItemResponse<T>>(new FakeItemResponse<T>(default!, status));
+            Stream responseBody = TypedWriteResponseOverride is null
+                ? CopyStored()
+                : new TrackingStream(TypedWriteResponseOverride);
+            ItemResponse<T> response = new FakeItemResponse<T>(serializer.FromStream<T>(responseBody), status);
             return Task.FromResult(response);
         }
 
@@ -1125,7 +1459,7 @@ public sealed class CosmosWrapperTests
         {
             Calls++; TypedReads++; LastOptions = requestOptions;
             if (EmptyTypedResponse) return Task.FromResult<ItemResponse<T>>(new FakeItemResponse<T>(default!, HttpStatusCode.OK));
-            ItemResponse<T> response = new FakeItemResponse<T>(serializer.FromStream<T>(processor.Buffers.Read(stored!)), HttpStatusCode.OK);
+            ItemResponse<T> response = new FakeItemResponse<T>(serializer.FromStream<T>(CopyStored()), HttpStatusCode.OK);
             return Task.FromResult(response);
         }
 
@@ -1133,13 +1467,52 @@ public sealed class CosmosWrapperTests
         {
             Calls++; StreamCreates++; LastOptions = requestOptions;
             return OnStreamCreate is not null ? OnStreamCreate(streamPayload, requestOptions, cancellationToken)
-                : Task.FromResult(CreateResponse ?? Response(HttpStatusCode.Created, processor.Buffers.Read(streamPayload)));
+                : StoreAndRespond(streamPayload, CreateResponse, HttpStatusCode.Created);
+        }
+
+        public override Task<ResponseMessage> UpsertItemStreamAsync(Stream streamPayload, PartitionKey partitionKey, ItemRequestOptions? requestOptions = null, CancellationToken cancellationToken = default)
+        {
+            Calls++; StreamUpserts++; LastOptions = requestOptions;
+            if (OnStreamUpsert is not null) return OnStreamUpsert(streamPayload, requestOptions, cancellationToken);
+            HttpStatusCode status = stored is null ? HttpStatusCode.Created : HttpStatusCode.OK;
+            return StoreAndRespond(streamPayload, UpsertResponse, status);
+        }
+
+        public override Task<ResponseMessage> ReplaceItemStreamAsync(Stream streamPayload, string id, PartitionKey partitionKey, ItemRequestOptions? requestOptions = null, CancellationToken cancellationToken = default)
+        {
+            Calls++; StreamReplaces++; LastOptions = requestOptions; LastId = id;
+            return OnStreamReplace is not null ? OnStreamReplace(streamPayload, requestOptions, cancellationToken)
+                : StoreAndRespond(streamPayload, ReplaceResponse, HttpStatusCode.OK);
+        }
+
+        private Task<ResponseMessage> StoreAndRespond(Stream streamPayload, ResponseMessage? configured, HttpStatusCode status)
+        {
+            Store(streamPayload);
+            return Task.FromResult(configured ?? Response(status, CopyStored()));
+        }
+
+        private void Store(Stream source)
+        {
+            stored?.Dispose();
+            stored = new MemoryStream();
+            source.CopyTo(stored);
+            stored.Position = 0;
+        }
+
+        private MemoryStream CopyStored()
+        {
+            MemoryStream copy = new();
+            stored!.Position = 0;
+            stored.CopyTo(copy);
+            stored.Position = 0;
+            copy.Position = 0;
+            return copy;
         }
 
         public override Task<ResponseMessage> ReadItemStreamAsync(string id, PartitionKey partitionKey, ItemRequestOptions? requestOptions = null, CancellationToken cancellationToken = default)
         {
             Calls++; LastOptions = requestOptions;
-            return Task.FromResult(ReadResponse ?? Response(HttpStatusCode.NotFound));
+            return Task.FromResult(ReadResponse ?? (stored is null ? Response(HttpStatusCode.NotFound) : Response(HttpStatusCode.OK, CopyStored())));
         }
 
         public override Task<ResponseMessage> DeleteItemStreamAsync(string id, PartitionKey partitionKey, ItemRequestOptions? requestOptions = null, CancellationToken cancellationToken = default)
@@ -1166,10 +1539,6 @@ public sealed class CosmosWrapperTests
         public override Task<ThroughputResponse> ReadThroughputAsync(RequestOptions requestOptions, CancellationToken cancellationToken = default) => throw Unexpected();
         public override Task<ThroughputResponse> ReplaceThroughputAsync(int throughput, RequestOptions? requestOptions = null, CancellationToken cancellationToken = default) => throw Unexpected();
         public override Task<ThroughputResponse> ReplaceThroughputAsync(ThroughputProperties throughputProperties, RequestOptions? requestOptions = null, CancellationToken cancellationToken = default) => throw Unexpected();
-        public override Task<ItemResponse<T>> UpsertItemAsync<T>(T item, PartitionKey? partitionKey = null, ItemRequestOptions? requestOptions = null, CancellationToken cancellationToken = default) => throw Unexpected();
-        public override Task<ResponseMessage> UpsertItemStreamAsync(Stream streamPayload, PartitionKey partitionKey, ItemRequestOptions? requestOptions = null, CancellationToken cancellationToken = default) => throw Unexpected();
-        public override Task<ItemResponse<T>> ReplaceItemAsync<T>(T item, string id, PartitionKey? partitionKey = null, ItemRequestOptions? requestOptions = null, CancellationToken cancellationToken = default) => throw Unexpected();
-        public override Task<ResponseMessage> ReplaceItemStreamAsync(Stream streamPayload, string id, PartitionKey partitionKey, ItemRequestOptions? requestOptions = null, CancellationToken cancellationToken = default) => throw Unexpected();
         public override Task<ItemResponse<T>> PatchItemAsync<T>(string id, PartitionKey partitionKey, IReadOnlyList<PatchOperation> patchOperations, PatchItemRequestOptions? requestOptions = null, CancellationToken cancellationToken = default) => throw Unexpected();
         public override Task<ResponseMessage> PatchItemStreamAsync(string id, PartitionKey partitionKey, IReadOnlyList<PatchOperation> patchOperations, PatchItemRequestOptions? requestOptions = null, CancellationToken cancellationToken = default) => throw Unexpected();
         public override Task<FeedResponse<T>> ReadManyItemsAsync<T>(IReadOnlyList<(string, PartitionKey)> items, ReadManyRequestOptions? readManyRequestOptions = null, CancellationToken cancellationToken = default) => throw Unexpected();
@@ -1177,14 +1546,26 @@ public sealed class CosmosWrapperTests
         public override FeedIterator<T> GetItemQueryIterator<T>(QueryDefinition queryDefinition, string? continuationToken = null, QueryRequestOptions? requestOptions = null) => throw Unexpected();
         public override FeedIterator<T> GetItemQueryIterator<T>(string? queryText = null, string? continuationToken = null, QueryRequestOptions? requestOptions = null) => throw Unexpected();
         public override FeedIterator<T> GetItemQueryIterator<T>(FeedRange feedRange, QueryDefinition queryDefinition, string? continuationToken = null, QueryRequestOptions? requestOptions = null) => throw Unexpected();
-        public override FeedIterator GetItemQueryStreamIterator(QueryDefinition queryDefinition, string? continuationToken = null, QueryRequestOptions? requestOptions = null) => throw Unexpected();
+        public override FeedIterator GetItemQueryStreamIterator(QueryDefinition queryDefinition, string? continuationToken = null, QueryRequestOptions? requestOptions = null)
+        {
+            Calls++; StreamQueryCalls++; LastQuery = queryDefinition; LastContinuation = continuationToken; LastQueryOptions = requestOptions;
+            return new EmptyFeedIterator();
+        }
         public override FeedIterator GetItemQueryStreamIterator(string? queryText = null, string? continuationToken = null, QueryRequestOptions? requestOptions = null) => throw Unexpected();
-        public override FeedIterator GetItemQueryStreamIterator(FeedRange feedRange, QueryDefinition queryDefinition, string? continuationToken = null, QueryRequestOptions? requestOptions = null) => throw Unexpected();
+        public override FeedIterator GetItemQueryStreamIterator(FeedRange feedRange, QueryDefinition queryDefinition, string? continuationToken = null, QueryRequestOptions? requestOptions = null)
+        {
+            Calls++; StreamQueryCalls++; LastQuery = queryDefinition; LastContinuation = continuationToken; LastQueryOptions = requestOptions;
+            return new EmptyFeedIterator();
+        }
         public override IOrderedQueryable<T> GetItemLinqQueryable<T>(bool allowSynchronousQueryExecution = false, string? continuationToken = null, QueryRequestOptions? requestOptions = null, CosmosLinqSerializerOptions? linqSerializerOptions = null) => throw Unexpected();
         public override TransactionalBatch CreateTransactionalBatch(PartitionKey partitionKey) => throw Unexpected();
         public override Task<IReadOnlyList<FeedRange>> GetFeedRangesAsync(CancellationToken cancellationToken = default) => throw Unexpected();
         public override FeedIterator<T> GetChangeFeedIterator<T>(ChangeFeedStartFrom changeFeedStartFrom, ChangeFeedMode changeFeedMode, ChangeFeedRequestOptions? changeFeedRequestOptions = null) => throw Unexpected();
-        public override FeedIterator GetChangeFeedStreamIterator(ChangeFeedStartFrom changeFeedStartFrom, ChangeFeedMode changeFeedMode, ChangeFeedRequestOptions? changeFeedRequestOptions = null) => throw Unexpected();
+        public override FeedIterator GetChangeFeedStreamIterator(ChangeFeedStartFrom changeFeedStartFrom, ChangeFeedMode changeFeedMode, ChangeFeedRequestOptions? changeFeedRequestOptions = null)
+        {
+            Calls++; ChangeFeedCalls++; LastChangeFeedStart = changeFeedStartFrom; LastChangeFeedMode = changeFeedMode; LastChangeFeedOptions = changeFeedRequestOptions;
+            return new EmptyFeedIterator();
+        }
         public override ChangeFeedEstimator GetChangeFeedEstimator(string processorName, Container leaseContainer) => throw Unexpected();
         public override ChangeFeedProcessorBuilder GetChangeFeedEstimatorBuilder(string processorName, ChangesEstimationHandler estimationDelegate, TimeSpan? estimationPeriod = null) => throw Unexpected();
         public override ChangeFeedProcessorBuilder GetChangeFeedProcessorBuilder<T>(string processorName, ChangesHandler<T> onChangesDelegate) => throw Unexpected();
@@ -1194,5 +1575,12 @@ public sealed class CosmosWrapperTests
         public override ChangeFeedProcessorBuilder GetChangeFeedProcessorBuilderWithManualCheckpoint(string processorName, ChangeFeedStreamHandlerWithManualCheckpoint onChangesDelegate) => throw Unexpected();
         public override Task<ResponseMessage> DeleteAllItemsByPartitionKeyStreamAsync(PartitionKey partitionKey, RequestOptions? requestOptions = null, CancellationToken cancellationToken = default) => throw Unexpected();
         public override ChangeFeedProcessorBuilder GetChangeFeedProcessorBuilderWithAllVersionsAndDeletes<T>(string processorName, ChangeFeedHandler<ChangeFeedItem<T>> onChangesDelegate) => throw Unexpected();
+    }
+
+    private sealed class EmptyFeedIterator : FeedIterator
+    {
+        public override bool HasMoreResults => false;
+        public override Task<ResponseMessage> ReadNextAsync(CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("The recording iterator must not be drained.");
     }
 }

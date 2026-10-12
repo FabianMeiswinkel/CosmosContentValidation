@@ -1,6 +1,7 @@
-# Content-validation protocol v1 (PR1)
+# Content-validation protocol v1 (unchanged through PR2)
 
-This is the implemented .NET PR1 wire contract, not a claim that later PRs are available.
+This is the implemented .NET wire contract established in PR1 and preserved unchanged by PR2's lifecycle/query/feed surfaces.
+PR3–PR5 are not available.
 See the [approved plan](implementation-plan.md) and [security/API boundary](security-and-supported-operations.md).
 The implementation is in [ContentValidationProcessor](../dotnet/src/CosmosContentValidation/ContentValidationProcessor.cs) and
 [ContentValidationSerializer](../dotnet/src/CosmosContentValidation/ContentValidationSerializer.cs).
@@ -91,6 +92,9 @@ The defaults are exactly `_rid`, `_self`, `_etag`, `_attachments`, `_ts`; **`ttl
 Matching is root-only, without wildcards or recursive name matching. Ignoring a root object excludes its **entire subtree**.
 For example, adding `ttl` and `cache` permits their addition/removal/change, but not changes to `nested.cache` or `Cache`.
 Excluded values remain in outbound documents, raw responses and the copy supplied to ordinary typed mapping; they are **unauthenticated**.
+Latest-version change feed is a transport-specific exception: Cosmos adds root `_lsn` after storage to identify the change-feed batch/transaction.
+Feed validation excludes that returned root field during hash recomputation without adding it to this v1 policy descriptor. Point-document
+validation does not make this exception, so an added/modified `_lsn` on a point read remains an invalid signature.
 They must still pass well-formedness, uniqueness, numeric, Unicode, depth and size checks before exclusion.
 Excluding `id`, `_contentValidation`, or any root containing a configured partition-key path is forbidden.
 Service-default/reserved roots cannot serve as partition-key roots either; protected identity cannot be configured away.
@@ -174,7 +178,7 @@ both hashes and signatures passed, and hashing the digest again failed verificat
 [CryptoTests](../dotnet/tests/CosmosContentValidation.Tests/CryptoTests.cs) covers independent prehash interoperability and rejection of double hashing/DER.
 [CanonicalizationTests](../dotnet/tests/CosmosContentValidation.Tests/CanonicalizationTests.cs) covers numeric/Unicode/depth acceptance, not unrestricted JCS conformance.
 These source tests do not establish that the new provider-boundary or guard tests have passed; see the
-[latest recorded validation evidence](pr1-validation.md) for executed checks, not an inferred result for subsequent edits.
+[latest recorded validation evidence](pr2-validation.md) for executed checks, not an inferred result for subsequent edits.
 The future security team is responsible for validating all replacement providers and their dependencies;
 user review must approve public interfaces, wire identifiers, exclusion identity, prehash semantics, provider ownership,
 restricted numeric acceptance and the [stored-procedure/write-trigger boundary](security-and-supported-operations.md).

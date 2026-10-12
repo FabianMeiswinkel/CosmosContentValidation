@@ -4,16 +4,16 @@ using Microsoft.IO;
 
 namespace CosmosContentValidation;
 
-/// <summary>Protects typed and stream point creates/reads; permits point deletes for cleanup.</summary>
+/// <summary>Protects typed and stream point creates, replaces, upserts and reads; permits point deletes for cleanup.</summary>
 /// <remarks>
-/// Every create requires an explicit partition key. Provisioning must verify that actual container
+/// Every typed write requires an explicit partition key. Provisioning must verify that actual container
 /// partition-key paths match ContentValidationProcessor.PartitionKeyPaths. This wrapper does not
 /// infer paths from a document or perform provisioning. All other content operations are blocked.
 /// Typed operations use the SDK serializer exactly once. Stream operations retain signed JSON.
 /// Caller input stays open; a seekable input's original position is restored. A successful returned
 /// response owns its pooled body until disposed. Service errors and delete responses are untouched.
 /// No-content writes are status-only, not proof of returned-content validation. A validation error
-/// after a successful create does not roll back the committed write.
+/// after a successful write does not roll back the committed write.
 /// Nonempty successful stream responses are validated even when write content is disabled.
 /// Typed item targets exclude streams and SDK resource DTOs that bypass the custom serializer.
 /// Typed content responses must materialize a nondefault value: the SDK returns default(T) without
@@ -24,6 +24,7 @@ public sealed class ContentValidationContainer : Container
     private readonly ContentValidationDatabase database;
     private readonly Container inner;
     private readonly ContentValidationProcessor processor;
+    private readonly ContentValidationSerializer querySerializer;
     private readonly bool contentResponseOnWrite;
 
     internal ContentValidationContainer(ContentValidationDatabase database, Container inner, ContentValidationProcessor processor, bool contentResponseOnWrite = true)
@@ -31,6 +32,7 @@ public sealed class ContentValidationContainer : Container
         this.database = database ?? throw new ArgumentNullException(nameof(database));
         this.inner = inner ?? throw new ArgumentNullException(nameof(inner));
         this.processor = processor ?? throw new ArgumentNullException(nameof(processor));
+        querySerializer = new ContentValidationSerializer(processor);
         this.contentResponseOnWrite = contentResponseOnWrite;
     }
 
@@ -39,15 +41,41 @@ public sealed class ContentValidationContainer : Container
 
     public override Task<ItemResponse<T>> CreateItemAsync<T>(T item, PartitionKey? partitionKey = null, ItemRequestOptions? requestOptions = null, CancellationToken cancellationToken = default)
     {
+        return WriteItemAsync(item, routeId: null, requireRouteId: false, partitionKey, requestOptions, cancellationToken,
+            (value, key, options, token) => inner.CreateItemAsync(value, key, options, token));
+    }
+
+    public override Task<ItemResponse<T>> UpsertItemAsync<T>(T item, PartitionKey? partitionKey = null, ItemRequestOptions? requestOptions = null, CancellationToken cancellationToken = default)
+    {
+        return WriteItemAsync(item, routeId: null, requireRouteId: false, partitionKey, requestOptions, cancellationToken,
+            (value, key, options, token) => inner.UpsertItemAsync(value, key, options, token));
+    }
+
+    public override Task<ItemResponse<T>> ReplaceItemAsync<T>(T item, string id, PartitionKey? partitionKey = null, ItemRequestOptions? requestOptions = null, CancellationToken cancellationToken = default)
+    {
+        return WriteItemAsync(item, id, requireRouteId: true, partitionKey, requestOptions, cancellationToken,
+            (value, key, options, token) => inner.ReplaceItemAsync(value, id, key, options, token));
+    }
+
+    private Task<ItemResponse<T>> WriteItemAsync<T>(
+        T item,
+        string? routeId,
+        bool requireRouteId,
+        PartitionKey? partitionKey,
+        ItemRequestOptions? requestOptions,
+        CancellationToken cancellationToken,
+        Func<T, PartitionKey?, ItemRequestOptions?, CancellationToken, Task<ItemResponse<T>>> submit)
+    {
         cancellationToken.ThrowIfCancellationRequested();
         RequireSigner();
         RejectSerializerBypassTarget<T>();
         ArgumentNullException.ThrowIfNull(item);
         if (item is Stream) throw Unsupported();
+        if (requireRouteId) ArgumentException.ThrowIfNullOrEmpty(routeId, "id");
         if (!partitionKey.HasValue) throw new ArgumentException("An explicit partition key is required.", nameof(partitionKey));
         ItemRequestOptions? snapshot = SnapshotOptions(requestOptions);
         cancellationToken.ThrowIfCancellationRequested();
-        return RequireTypedContentAsync(inner.CreateItemAsync(item, partitionKey, snapshot, cancellationToken),
+        return RequireTypedContentAsync(submit(item, partitionKey, snapshot, cancellationToken),
             snapshot?.EnableContentResponseOnWrite ?? contentResponseOnWrite);
     }
 
@@ -86,18 +114,43 @@ public sealed class ContentValidationContainer : Container
         return inner.DeleteItemStreamAsync(id, partitionKey, snapshot, cancellationToken);
     }
 
-    public override async Task<ResponseMessage> CreateItemStreamAsync(Stream streamPayload, PartitionKey partitionKey, ItemRequestOptions? requestOptions = null, CancellationToken cancellationToken = default)
+    public override Task<ResponseMessage> CreateItemStreamAsync(Stream streamPayload, PartitionKey partitionKey, ItemRequestOptions? requestOptions = null, CancellationToken cancellationToken = default)
+    {
+        return WriteItemStreamAsync(streamPayload, routeId: null, requireRouteId: false, requestOptions, cancellationToken,
+            (body, options, token) => inner.CreateItemStreamAsync(body, partitionKey, options, token));
+    }
+
+    public override Task<ResponseMessage> UpsertItemStreamAsync(Stream streamPayload, PartitionKey partitionKey, ItemRequestOptions? requestOptions = null, CancellationToken cancellationToken = default)
+    {
+        return WriteItemStreamAsync(streamPayload, routeId: null, requireRouteId: false, requestOptions, cancellationToken,
+            (body, options, token) => inner.UpsertItemStreamAsync(body, partitionKey, options, token));
+    }
+
+    public override Task<ResponseMessage> ReplaceItemStreamAsync(Stream streamPayload, string id, PartitionKey partitionKey, ItemRequestOptions? requestOptions = null, CancellationToken cancellationToken = default)
+    {
+        return WriteItemStreamAsync(streamPayload, id, requireRouteId: true, requestOptions, cancellationToken,
+            (body, options, token) => inner.ReplaceItemStreamAsync(body, id, partitionKey, options, token));
+    }
+
+    private async Task<ResponseMessage> WriteItemStreamAsync(
+        Stream streamPayload,
+        string? routeId,
+        bool requireRouteId,
+        ItemRequestOptions? requestOptions,
+        CancellationToken cancellationToken,
+        Func<Stream, ItemRequestOptions?, CancellationToken, Task<ResponseMessage>> submit)
     {
         cancellationToken.ThrowIfCancellationRequested();
         RequireSigner();
         ArgumentNullException.ThrowIfNull(streamPayload);
+        if (requireRouteId) ArgumentException.ThrowIfNullOrEmpty(routeId, "id");
         ItemRequestOptions? snapshot = SnapshotOptions(requestOptions);
         using RecyclableMemoryStream buffered = await processor.Buffers.ReadAsync(streamPayload, cancellationToken, processor.MaxDocumentBytes).ConfigureAwait(false);
         cancellationToken.ThrowIfCancellationRequested();
         using RecyclableMemoryStream signed = processor.Sign(buffered.GetReadOnlySequence(), replaceExistingSignature: true);
         cancellationToken.ThrowIfCancellationRequested();
         // Keep both owned streams alive through all SDK retries and response processing.
-        ResponseMessage response = await inner.CreateItemStreamAsync(signed, partitionKey, snapshot, cancellationToken).ConfigureAwait(false);
+        ResponseMessage response = await submit(signed, snapshot, cancellationToken).ConfigureAwait(false);
         bool expectContent = snapshot?.EnableContentResponseOnWrite ?? contentResponseOnWrite;
         return await ValidateResponseAsync(response, expectContent, cancellationToken).ConfigureAwait(false);
     }
@@ -162,7 +215,7 @@ public sealed class ContentValidationContainer : Container
             throw new ContentValidationException(ContentValidationFailure.SigningUnavailable, "This processor has no signing capability.");
     }
 
-    private static void RejectSerializerBypassTarget<T>()
+    internal static void RejectSerializerBypassTarget<T>()
     {
         // The SDK's Stream target bypasses deserialization. Derived streams must also be refused.
         Type target = typeof(T);
@@ -240,26 +293,76 @@ public sealed class ContentValidationContainer : Container
     public override Task<ThroughputResponse> ReadThroughputAsync(RequestOptions requestOptions, CancellationToken cancellationToken = default) => throw Unsupported();
     public override Task<ThroughputResponse> ReplaceThroughputAsync(int throughput, RequestOptions? requestOptions = null, CancellationToken cancellationToken = default) => throw Unsupported();
     public override Task<ThroughputResponse> ReplaceThroughputAsync(ThroughputProperties throughputProperties, RequestOptions? requestOptions = null, CancellationToken cancellationToken = default) => throw Unsupported();
-    public override Task<ItemResponse<T>> UpsertItemAsync<T>(T item, PartitionKey? partitionKey = null, ItemRequestOptions? requestOptions = null, CancellationToken cancellationToken = default) => throw Unsupported();
-    public override Task<ResponseMessage> UpsertItemStreamAsync(Stream streamPayload, PartitionKey partitionKey, ItemRequestOptions? requestOptions = null, CancellationToken cancellationToken = default) => throw Unsupported();
-    public override Task<ItemResponse<T>> ReplaceItemAsync<T>(T item, string id, PartitionKey? partitionKey = null, ItemRequestOptions? requestOptions = null, CancellationToken cancellationToken = default) => throw Unsupported();
-    public override Task<ResponseMessage> ReplaceItemStreamAsync(Stream streamPayload, string id, PartitionKey partitionKey, ItemRequestOptions? requestOptions = null, CancellationToken cancellationToken = default) => throw Unsupported();
     public override Task<ItemResponse<T>> PatchItemAsync<T>(string id, PartitionKey partitionKey, IReadOnlyList<PatchOperation> patchOperations, PatchItemRequestOptions? requestOptions = null, CancellationToken cancellationToken = default) => throw Unsupported();
     public override Task<ResponseMessage> PatchItemStreamAsync(string id, PartitionKey partitionKey, IReadOnlyList<PatchOperation> patchOperations, PatchItemRequestOptions? requestOptions = null, CancellationToken cancellationToken = default) => throw Unsupported();
     public override Task<FeedResponse<T>> ReadManyItemsAsync<T>(IReadOnlyList<(string, PartitionKey)> items, ReadManyRequestOptions? readManyRequestOptions = null, CancellationToken cancellationToken = default) => throw Unsupported();
     public override Task<ResponseMessage> ReadManyItemsStreamAsync(IReadOnlyList<(string, PartitionKey)> items, ReadManyRequestOptions? readManyRequestOptions = null, CancellationToken cancellationToken = default) => throw Unsupported();
-    public override FeedIterator<T> GetItemQueryIterator<T>(QueryDefinition queryDefinition, string? continuationToken = null, QueryRequestOptions? requestOptions = null) => throw Unsupported();
-    public override FeedIterator<T> GetItemQueryIterator<T>(string? queryText = null, string? continuationToken = null, QueryRequestOptions? requestOptions = null) => throw Unsupported();
-    public override FeedIterator<T> GetItemQueryIterator<T>(FeedRange feedRange, QueryDefinition queryDefinition, string? continuationToken = null, QueryRequestOptions? requestOptions = null) => throw Unsupported();
-    public override FeedIterator GetItemQueryStreamIterator(QueryDefinition queryDefinition, string? continuationToken = null, QueryRequestOptions? requestOptions = null) => throw Unsupported();
-    public override FeedIterator GetItemQueryStreamIterator(string? queryText = null, string? continuationToken = null, QueryRequestOptions? requestOptions = null) => throw Unsupported();
-    public override FeedIterator GetItemQueryStreamIterator(FeedRange feedRange, QueryDefinition queryDefinition, string? continuationToken = null, QueryRequestOptions? requestOptions = null) => throw Unsupported();
+    public override FeedIterator<T> GetItemQueryIterator<T>(QueryDefinition queryDefinition, string? continuationToken = null, QueryRequestOptions? requestOptions = null)
+    {
+        RejectSerializerBypassTarget<T>();
+        QueryDefinition snapshot = SnapshotQuery(queryDefinition);
+        QueryRequestOptions? options = ContentValidationRequestOptions.Snapshot(requestOptions, stream: false);
+        return new ContentValidationFeedIterator<T>(inner.GetItemQueryStreamIterator(snapshot, continuationToken, options),
+            processor, database.Client.ResponseFactory);
+    }
+
+    public override FeedIterator<T> GetItemQueryIterator<T>(string? queryText = null, string? continuationToken = null, QueryRequestOptions? requestOptions = null)
+    {
+        ContentValidationQueryGuard.Validate(queryText);
+        return GetItemQueryIterator<T>(new QueryDefinition(queryText!), continuationToken, requestOptions);
+    }
+
+    public override FeedIterator<T> GetItemQueryIterator<T>(FeedRange feedRange, QueryDefinition queryDefinition, string? continuationToken = null, QueryRequestOptions? requestOptions = null)
+    {
+        ArgumentNullException.ThrowIfNull(feedRange);
+        RejectSerializerBypassTarget<T>();
+        QueryDefinition snapshot = SnapshotQuery(queryDefinition);
+        QueryRequestOptions? options = ContentValidationRequestOptions.Snapshot(requestOptions, stream: false);
+        return new ContentValidationFeedIterator<T>(inner.GetItemQueryStreamIterator(feedRange, snapshot, continuationToken, options),
+            processor, database.Client.ResponseFactory);
+    }
+
+    public override FeedIterator GetItemQueryStreamIterator(QueryDefinition queryDefinition, string? continuationToken = null, QueryRequestOptions? requestOptions = null)
+    {
+        QueryDefinition snapshot = SnapshotQuery(queryDefinition);
+        QueryRequestOptions? options = ContentValidationRequestOptions.Snapshot(requestOptions, stream: true);
+        return new ContentValidationFeedIterator(inner.GetItemQueryStreamIterator(snapshot, continuationToken, options), processor);
+    }
+
+    public override FeedIterator GetItemQueryStreamIterator(string? queryText = null, string? continuationToken = null, QueryRequestOptions? requestOptions = null)
+    {
+        ContentValidationQueryGuard.Validate(queryText);
+        return GetItemQueryStreamIterator(new QueryDefinition(queryText!), continuationToken, requestOptions);
+    }
+
+    public override FeedIterator GetItemQueryStreamIterator(FeedRange feedRange, QueryDefinition queryDefinition, string? continuationToken = null, QueryRequestOptions? requestOptions = null)
+    {
+        ArgumentNullException.ThrowIfNull(feedRange);
+        QueryDefinition snapshot = SnapshotQuery(queryDefinition);
+        QueryRequestOptions? options = ContentValidationRequestOptions.Snapshot(requestOptions, stream: true);
+        return new ContentValidationFeedIterator(inner.GetItemQueryStreamIterator(feedRange, snapshot, continuationToken, options), processor);
+    }
     public override IOrderedQueryable<T> GetItemLinqQueryable<T>(bool allowSynchronousQueryExecution = false, string? continuationToken = null, QueryRequestOptions? requestOptions = null, CosmosLinqSerializerOptions? linqSerializerOptions = null) => throw Unsupported();
     public override TransactionalBatch CreateTransactionalBatch(PartitionKey partitionKey) => throw Unsupported();
     public override Task<ResponseMessage> DeleteAllItemsByPartitionKeyStreamAsync(PartitionKey partitionKey, RequestOptions? requestOptions = null, CancellationToken cancellationToken = default) => throw Unsupported();
     public override Task<IReadOnlyList<FeedRange>> GetFeedRangesAsync(CancellationToken cancellationToken = default) => throw Unsupported();
-    public override FeedIterator<T> GetChangeFeedIterator<T>(ChangeFeedStartFrom changeFeedStartFrom, ChangeFeedMode changeFeedMode, ChangeFeedRequestOptions? changeFeedRequestOptions = null) => throw Unsupported();
-    public override FeedIterator GetChangeFeedStreamIterator(ChangeFeedStartFrom changeFeedStartFrom, ChangeFeedMode changeFeedMode, ChangeFeedRequestOptions? changeFeedRequestOptions = null) => throw Unsupported();
+    public override FeedIterator<T> GetChangeFeedIterator<T>(ChangeFeedStartFrom changeFeedStartFrom, ChangeFeedMode changeFeedMode, ChangeFeedRequestOptions? changeFeedRequestOptions = null)
+    {
+        ArgumentNullException.ThrowIfNull(changeFeedStartFrom);
+        RequireLatestVersion(changeFeedMode);
+        RejectSerializerBypassTarget<T>();
+        ChangeFeedRequestOptions? options = ContentValidationRequestOptions.Snapshot(changeFeedRequestOptions);
+        return new ContentValidationFeedIterator<T>(inner.GetChangeFeedStreamIterator(changeFeedStartFrom, changeFeedMode, options),
+            processor, database.Client.ResponseFactory);
+    }
+
+    public override FeedIterator GetChangeFeedStreamIterator(ChangeFeedStartFrom changeFeedStartFrom, ChangeFeedMode changeFeedMode, ChangeFeedRequestOptions? changeFeedRequestOptions = null)
+    {
+        ArgumentNullException.ThrowIfNull(changeFeedStartFrom);
+        RequireLatestVersion(changeFeedMode);
+        ChangeFeedRequestOptions? options = ContentValidationRequestOptions.Snapshot(changeFeedRequestOptions);
+        return new ContentValidationFeedIterator(inner.GetChangeFeedStreamIterator(changeFeedStartFrom, changeFeedMode, options), processor);
+    }
     public override ChangeFeedEstimator GetChangeFeedEstimator(string processorName, Container leaseContainer) => throw Unsupported();
     public override ChangeFeedProcessorBuilder GetChangeFeedEstimatorBuilder(string processorName, ChangesEstimationHandler estimationDelegate, TimeSpan? estimationPeriod = null) => throw Unsupported();
     public override ChangeFeedProcessorBuilder GetChangeFeedProcessorBuilder<T>(string processorName, ChangesHandler<T> onChangesDelegate) => throw Unsupported();
@@ -268,4 +371,24 @@ public sealed class ContentValidationContainer : Container
     public override ChangeFeedProcessorBuilder GetChangeFeedProcessorBuilderWithManualCheckpoint<T>(string processorName, ChangeFeedHandlerWithManualCheckpoint<T> onChangesDelegate) => throw Unsupported();
     public override ChangeFeedProcessorBuilder GetChangeFeedProcessorBuilderWithManualCheckpoint(string processorName, ChangeFeedStreamHandlerWithManualCheckpoint onChangesDelegate) => throw Unsupported();
     public override ChangeFeedProcessorBuilder GetChangeFeedProcessorBuilderWithAllVersionsAndDeletes<T>(string processorName, ChangeFeedHandler<ChangeFeedItem<T>> onChangesDelegate) => throw Unsupported();
+
+    private QueryDefinition SnapshotQuery(QueryDefinition queryDefinition)
+    {
+        ArgumentNullException.ThrowIfNull(queryDefinition);
+        ContentValidationQueryGuard.Validate(queryDefinition.QueryText);
+        if (queryDefinition is ContentValidationQueryDefinition guarded)
+            return guarded.Build(querySerializer);
+        if (queryDefinition.GetType() != typeof(QueryDefinition) || queryDefinition.GetQueryParameters().Count != 0)
+            throw new ContentValidationException(ContentValidationFailure.UnsupportedOperation,
+                "Use ContentValidationQueryDefinition for parameterized queries.");
+        return new QueryDefinition(queryDefinition.QueryText);
+    }
+
+    private static void RequireLatestVersion(ChangeFeedMode changeFeedMode)
+    {
+        ArgumentNullException.ThrowIfNull(changeFeedMode);
+        if (!ReferenceEquals(changeFeedMode, ChangeFeedMode.LatestVersion))
+            throw new ContentValidationException(ContentValidationFailure.UnsupportedOperation,
+                "Only latest-version (incremental) pull change feed is supported.");
+    }
 }

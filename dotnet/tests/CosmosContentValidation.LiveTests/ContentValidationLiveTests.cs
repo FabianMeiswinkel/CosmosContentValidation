@@ -13,6 +13,7 @@ namespace CosmosContentValidation.LiveTests;
 /// protected operations. All documents explicitly disable expiry initially (ttl=-1).
 /// Six theories / 24 rows; each scenario runs against Direct and Gateway independently.
 /// </summary>
+[Collection("Cosmos content validation live")]
 public sealed class ContentValidationLiveTests(LiveSigningFixture fixture, ITestOutputHelper output)
     : IClassFixture<LiveSigningFixture>
 {
@@ -55,7 +56,7 @@ public sealed class ContentValidationLiveTests(LiveSigningFixture fixture, ITest
             "/customerTag" => PatchOperation.Set(path, "changed"),
             _ => throw new LiveTestFailure("Unexpected test-owned patch path.")
         };
-        await scope.PatchAsync(item, change);
+        await scope.TamperAsync(item, change);
         await RejectBothReadsAsync(scope, item);
     });
 
@@ -70,13 +71,13 @@ public sealed class ContentValidationLiveTests(LiveSigningFixture fixture, ITest
         await CreateAndCheckAsync(scope, item, streamCreate);
         await ReadBothAsync(scope, item);
 
-        await scope.PatchAsync(item, PatchOperation.Set("/ttl", -1), PatchOperation.Set("/customerTag", "changed"));
+        await scope.TamperAsync(item, PatchOperation.Set("/ttl", -1), PatchOperation.Set("/customerTag", "changed"));
         await ReadBothAsync(scope, item, expectedTag: "changed");
 
-        await scope.PatchAsync(item, PatchOperation.Remove("/customerTag"));
+        await scope.TamperAsync(item, PatchOperation.Remove("/customerTag"));
         await ReadBothAsync(scope, item, expectedTag: null);
 
-        await scope.PatchAsync(item, PatchOperation.Add("/customerTag", "added"), PatchOperation.Set("/ttl", 86400));
+        await scope.TamperAsync(item, PatchOperation.Add("/customerTag", "added"), PatchOperation.Set("/ttl", 86400));
         await ReadBothAsync(scope, item, expectedTtl: 86400, expectedTag: "added");
         // Root exclusions permit changes without a signer. Nested same-name fields were unchanged.
     });
@@ -98,7 +99,7 @@ public sealed class ContentValidationLiveTests(LiveSigningFixture fixture, ITest
         PatchOperation change = path is "/nested/ttl" or "/TTL"
             ? PatchOperation.Set(path, 86400)
             : PatchOperation.Set(path, "changed");
-        await scope.PatchAsync(item, change);
+        await scope.TamperAsync(item, change);
         await RejectBothReadsAsync(scope, item);
     });
 

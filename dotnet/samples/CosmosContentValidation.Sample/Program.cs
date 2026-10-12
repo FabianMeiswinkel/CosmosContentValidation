@@ -19,7 +19,7 @@ internal static class Program
         if (args.Contains("--help", StringComparer.Ordinal) || args.Contains("-h", StringComparer.Ordinal))
         {
             Console.WriteLine("""
-                Cosmos content validation — PR1 point create/read sample (.NET 10)
+                Cosmos content validation — PR2 lifecycle/query/change-feed sample (.NET 10)
 
                 --help       Show help without reading keys or acquiring credentials.
                 --offline    Run serializer/signature/tamper checks using ephemeral in-memory
@@ -43,6 +43,9 @@ internal static class Program
                 Both keys are loaded once and verified together BEFORE any network call/write.
                 Ignored fields are unauthenticated, exact-case, root-only; id/pk/envelope cannot
                 be ignored. For --tamper, leave the sample's 'value' field protected.
+                Queries must begin SELECT * FROM and return complete documents. The sample uses
+                bounded latest-version pull change feed; it does not promise completeness,
+                intermediate versions, deletes, freshness, rollback prevention, or query signing.
                 No database/container provisioning or deletion. Only acknowledged new items are
                 cleaned up; ambiguous writes report generated IDs for manual inspection.
                 """);
@@ -237,17 +240,40 @@ internal static class Program
         Container reads = readerClient.GetContainer(configuration.Database, configuration.Container);
         string prefix = Guid.NewGuid().ToString("N") + "-cv-sample";
         // The ledger contains ONLY this run's identities. Success, not a GUID alone, establishes ownership.
-        OwnedItem[] items = [new(prefix + "-typed", prefix), new(prefix + "-stream", prefix)];
+        OwnedItem[] items =
+        [
+            new(prefix + "-typed", prefix + "-a"),
+            new(prefix + "-stream", prefix + "-b"),
+            new(prefix + "-upsert", prefix + "-c")
+        ];
         bool primaryFailed = false;
         bool cleanupFailed;
         try
         {
+            string typedFeedCheckpoint = await CaptureTypedChangeFeedCheckpointAsync(reads, items[0], timeout.Token);
+            string streamFeedCheckpoint = await CaptureStreamChangeFeedCheckpointAsync(reads, items[1], timeout.Token);
+
             OwnedItem typedItem = items[0];
             SampleDocument model = new(typedItem.Id, typedItem.Pk);
             ItemResponse<SampleDocument> created = await CreateTypedAsync(writes, typedItem, model, timeout.Token);
             CheckTyped(created, typedItem, HttpStatusCode.Created);
             Console.WriteLine("Typed create: 201, returned model materialized and signature verified.");
             await ReadBothAsync(reads, typedItem, timeout.Token);
+
+            model.Value = 8;
+            ItemResponse<SampleDocument> replaced = await writes.ReplaceItemAsync(model, typedItem.Id, typedItem.PartitionKey,
+                new ItemRequestOptions { IfMatchEtag = typedItem.ETag, EnableContentResponseOnWrite = true }, timeout.Token);
+            typedItem.Observe(replaced.Headers);
+            CheckTyped(replaced, typedItem, HttpStatusCode.OK, expectedValue: 8);
+            Console.WriteLine("Typed replace: current ETag accepted; replacement content verified (200).");
+
+            model.Value = 9;
+            ItemResponse<SampleDocument> upserted = await writes.UpsertItemAsync(model, typedItem.PartitionKey,
+                new ItemRequestOptions { EnableContentResponseOnWrite = false }, timeout.Token);
+            Require(upserted.StatusCode == HttpStatusCode.OK, "Typed update upsert did not return 200.");
+            typedItem.Observe(upserted.Headers);
+            await ReadBothAsync(reads, typedItem, timeout.Token, expectedValue: 9);
+            Console.WriteLine("Typed upsert update: status-only response followed by mandatory protected readback.");
 
             OwnedItem streamItem = items[1];
             using (MemoryStream payload = new(JsonSerializer.SerializeToUtf8Bytes(new SampleDocument(streamItem.Id, streamItem.Pk)), writable: false))
@@ -260,6 +286,39 @@ internal static class Program
                 Console.WriteLine("Stream create: 201, signed body consumed and replayed; caller input remains open.");
             }
             await ReadBothAsync(reads, streamItem, timeout.Token);
+
+            using (MemoryStream replacement = new(JsonSerializer.SerializeToUtf8Bytes(
+                new SampleDocument(streamItem.Id, streamItem.Pk) { Value = 8 }), writable: false))
+            using (ResponseMessage response = await writes.ReplaceItemStreamAsync(replacement, streamItem.Id, streamItem.PartitionKey,
+                new ItemRequestOptions { IfMatchEtag = streamItem.ETag, EnableContentResponseOnWrite = false }, timeout.Token))
+            {
+                response.EnsureSuccessStatusCode();
+                Require(response.StatusCode == HttpStatusCode.OK && replacement.Position == 0,
+                    "Status-only stream replace failed or changed caller stream position.");
+                streamItem.Observe(response.Headers);
+            }
+            await ReadBothAsync(reads, streamItem, timeout.Token, expectedValue: 8);
+            Console.WriteLine("Stream replace: ETag-conditional status-only response followed by protected readback.");
+
+            OwnedItem upsertItem = items[2];
+            using (MemoryStream payload = new(JsonSerializer.SerializeToUtf8Bytes(
+                new SampleDocument(upsertItem.Id, upsertItem.Pk)), writable: false))
+            using (ResponseMessage response = await writes.UpsertItemStreamAsync(payload, upsertItem.PartitionKey,
+                new ItemRequestOptions { EnableContentResponseOnWrite = true }, timeout.Token))
+            {
+                response.EnsureSuccessStatusCode();
+                Require(response.StatusCode == HttpStatusCode.Created && payload.Position == 0,
+                    "Stream insert upsert did not return 201 or preserve caller stream position.");
+                upsertItem.Confirm(response.Headers);
+                await ConsumeStreamAsync(response, upsertItem, timeout.Token);
+            }
+            await ReadBothAsync(reads, upsertItem, timeout.Token);
+            Console.WriteLine("Stream upsert insert: 201 response and public-only readback verified.");
+
+            await DemonstrateQueriesAsync(reads, typedItem, prefix, items.Length, timeout.Token);
+            await PollTypedChangeFeedAsync(reads, typedFeedCheckpoint, typedItem, timeout.Token);
+            await PollStreamChangeFeedAsync(reads, streamFeedCheckpoint, streamItem, timeout.Token);
+            Console.WriteLine("Latest-version pull change feed: scoped typed/stream bounded polling, 304/empty handling and post-validation checkpoints verified.");
 
             // This is a local capability demonstration, not a service write attempt. Actual wrapper
             // rejection of both typed/stream writes is also exercised by the opt-in live suite.
@@ -283,7 +342,7 @@ internal static class Program
                     patched.EnsureSuccessStatusCode();
                     await ExpectTamperedReadsAsync(reads, item, timeout.Token);
                 }
-                Console.WriteLine("Explicit tamper demonstration: both own items patched; typed and stream reads rejected InvalidSignature.");
+                Console.WriteLine("Explicit tamper demonstration: own items patched; typed and stream reads rejected InvalidSignature.");
             }
         }
         catch
@@ -340,39 +399,160 @@ internal static class Program
         Console.Error.WriteLine($"WARNING: {reason} id={item.Id}, pk={item.Pk}. Inspect/clean up manually; this run will NOT patch/delete it.");
     }
 
-    private static async Task ReadBothAsync(Container reader, OwnedItem item, CancellationToken token)
+    private static async Task ReadBothAsync(Container reader, OwnedItem item, CancellationToken token, int expectedValue = 7)
     {
         // Separate clients need the write session token to avoid reading an older version/404.
         ItemResponse<SampleDocument> typed = await reader.ReadItemAsync<SampleDocument>(item.Id, item.PartitionKey, item.ReadOptions(), token);
-        CheckTyped(typed, item, HttpStatusCode.OK);
+        CheckTyped(typed, item, HttpStatusCode.OK, expectedValue);
         using ResponseMessage streamed = await reader.ReadItemStreamAsync(item.Id, item.PartitionKey, item.ReadOptions(), token);
         streamed.EnsureSuccessStatusCode();
         Require(streamed.StatusCode == HttpStatusCode.OK, "Stream read did not return 200.");
-        await ConsumeStreamAsync(streamed, item, token);
+        await ConsumeStreamAsync(streamed, item, token, expectedValue);
         Console.WriteLine("Public-only reads: typed model and replayable stream verified (200); service metadata preserved.");
     }
 
-    private static void CheckTyped(ItemResponse<SampleDocument> response, OwnedItem item, HttpStatusCode expected)
+    private static void CheckTyped(ItemResponse<SampleDocument> response, OwnedItem item, HttpStatusCode expected, int expectedValue = 7)
     {
         SampleDocument result = response.Resource; // Native SDK materialization, not a status-only claim.
         Require(response.StatusCode == expected && result is not null && result.Id == item.Id && result.Pk == item.Pk
-            && result.Value == 7 && !string.IsNullOrWhiteSpace(result.ETag) && result.ETag == response.Headers.ETag,
+            && result.Value == expectedValue && !string.IsNullOrWhiteSpace(result.ETag) && result.ETag == response.Headers.ETag,
             "Typed response status, materialized content, or service ETag did not match expectations.");
     }
 
-    private static async Task ConsumeStreamAsync(ResponseMessage response, OwnedItem item, CancellationToken token)
+    private static async Task ConsumeStreamAsync(ResponseMessage response, OwnedItem item, CancellationToken token, int expectedValue = 7)
     {
         Stream content = response.Content;
         Require(content is not null && content.CanRead && content.CanSeek && content.Position == 0, "Signed response is not a live, rewound stream.");
         using JsonDocument first = await JsonDocument.ParseAsync(content!, cancellationToken: token);
         JsonElement root = first.RootElement;
         Require(root.GetProperty("id").GetString() == item.Id && root.GetProperty("pk").GetString() == item.Pk
-            && root.GetProperty("value").GetInt32() == 7 && root.GetProperty("_etag").GetString() == response.Headers.ETag
+            && root.GetProperty("value").GetInt32() == expectedValue && root.GetProperty("_etag").GetString() == response.Headers.ETag
             && root.TryGetProperty(ContentValidationProcessor.SignaturePropertyName, out _), "Signed stream content was not preserved.");
         content!.Position = 0;
         using JsonDocument replay = await JsonDocument.ParseAsync(content, cancellationToken: token);
         Require(JsonElement.DeepEquals(root, replay.RootElement), "Rewound response changed on replay.");
         content.Position = 0; // Borrow only; ResponseMessage still owns the body.
+    }
+
+    private static async Task DemonstrateQueriesAsync(Container reader, OwnedItem item, string prefix, int expectedCount,
+        CancellationToken token)
+    {
+        ContentValidationQueryDefinition single = new ContentValidationQueryDefinition(
+            "SELECT * FROM c WHERE c.pk = @pk AND c.id = @identity.id")
+            .WithParameter("@pk", item.Pk)
+            .WithParameter("@identity", new { id = item.Id });
+        using (FeedIterator<SampleDocument> iterator = reader.GetItemQueryIterator<SampleDocument>(single,
+            requestOptions: new QueryRequestOptions { PartitionKey = item.PartitionKey, MaxItemCount = 1 }))
+        {
+            FeedResponse<SampleDocument> page = await iterator.ReadNextAsync(token);
+            SampleDocument result = page.Single();
+            Require(result.Id == item.Id && result.Value == 9,
+                "Parameterized single-partition query did not materialize the expected complete document.");
+        }
+
+        ContentValidationQueryDefinition cross = new ContentValidationQueryDefinition(
+            "SELECT * FROM c WHERE STARTSWITH(c.id, @prefix) ORDER BY c.id")
+            .WithParameter("@prefix", prefix);
+        HashSet<string> ids = new(StringComparer.Ordinal);
+        string? continuation;
+        using (FeedIterator<SampleDocument> first = reader.GetItemQueryIterator<SampleDocument>(cross,
+            requestOptions: new QueryRequestOptions { MaxItemCount = 1 }))
+        {
+            FeedResponse<SampleDocument> page = await first.ReadNextAsync(token);
+            foreach (SampleDocument document in page) ids.Add(document.Id);
+            continuation = page.ContinuationToken;
+        }
+        if (continuation is not null)
+        {
+            using FeedIterator<SampleDocument> resumed = reader.GetItemQueryIterator<SampleDocument>(cross, continuation,
+                new QueryRequestOptions { MaxItemCount = 1 });
+            while (resumed.HasMoreResults)
+            {
+                FeedResponse<SampleDocument> page = await resumed.ReadNextAsync(token);
+                foreach (SampleDocument document in page) ids.Add(document.Id);
+            }
+        }
+        Require(ids.Count == expectedCount, "Cross-partition continuation resume did not return all run-owned documents.");
+
+        using FeedIterator stream = reader.GetItemQueryStreamIterator(cross,
+            requestOptions: new QueryRequestOptions { MaxItemCount = 1 });
+        using ResponseMessage response = await stream.ReadNextAsync(token);
+        response.EnsureSuccessStatusCode();
+        using JsonDocument envelope = await JsonDocument.ParseAsync(response.Content, cancellationToken: token);
+        Require(envelope.RootElement.TryGetProperty("Documents", out JsonElement documents)
+            && documents.ValueKind == JsonValueKind.Array,
+            "Stream query did not retain the exact service Documents envelope.");
+        response.Content.Position = 0;
+        Console.WriteLine("Queries: ordinary scalar/object parameters, single/cross partition, stream envelope, pagination and fresh-iterator resume verified.");
+    }
+
+    private static async Task<string> CaptureTypedChangeFeedCheckpointAsync(Container reader, OwnedItem item, CancellationToken token)
+    {
+        using FeedIterator<SampleDocument> iterator = reader.GetChangeFeedIterator<SampleDocument>(
+            ChangeFeedStartFrom.Now(FeedRange.FromPartitionKey(item.PartitionKey)), ChangeFeedMode.LatestVersion,
+            new ChangeFeedRequestOptions { PageSizeHint = 1 });
+        FeedResponse<SampleDocument> page = await iterator.ReadNextAsync(token);
+        Require(page.Count == 0 && !string.IsNullOrWhiteSpace(page.ContinuationToken),
+            "Typed change-feed NOW checkpoint did not return an empty page with continuation.");
+        return page.ContinuationToken;
+    }
+
+    private static async Task<string> CaptureStreamChangeFeedCheckpointAsync(Container reader, OwnedItem item, CancellationToken token)
+    {
+        using FeedIterator iterator = reader.GetChangeFeedStreamIterator(
+            ChangeFeedStartFrom.Now(FeedRange.FromPartitionKey(item.PartitionKey)), ChangeFeedMode.LatestVersion,
+            new ChangeFeedRequestOptions { PageSizeHint = 1 });
+        using ResponseMessage page = await iterator.ReadNextAsync(token);
+        Require(page.StatusCode == HttpStatusCode.NotModified && !string.IsNullOrWhiteSpace(page.ContinuationToken),
+            "Stream change-feed NOW checkpoint did not return 304 with continuation.");
+        return page.ContinuationToken;
+    }
+
+    private static async Task PollTypedChangeFeedAsync(Container reader, string checkpoint, OwnedItem item,
+        CancellationToken token)
+    {
+        DateTime deadline = DateTime.UtcNow.AddSeconds(30);
+        string continuation = checkpoint;
+        while (DateTime.UtcNow < deadline)
+        {
+            using FeedIterator<SampleDocument> iterator = reader.GetChangeFeedIterator<SampleDocument>(
+                ChangeFeedStartFrom.ContinuationToken(continuation), ChangeFeedMode.LatestVersion,
+                new ChangeFeedRequestOptions { PageSizeHint = 1 });
+            FeedResponse<SampleDocument> page = await iterator.ReadNextAsync(token);
+            if (page.Any(document => document.Id == item.Id)) return;
+            Require(!string.IsNullOrWhiteSpace(page.ContinuationToken), "Typed change-feed page omitted continuation.");
+            continuation = page.ContinuationToken; // Only after successful validation and processing.
+            if (page.Count == 0) await Task.Delay(250, token);
+        }
+        throw new SampleFailure("Typed latest-version change feed did not observe its run-owned item within 30 seconds.");
+    }
+
+    private static async Task PollStreamChangeFeedAsync(Container reader, string checkpoint, OwnedItem item,
+        CancellationToken token)
+    {
+        DateTime deadline = DateTime.UtcNow.AddSeconds(30);
+        string continuation = checkpoint;
+        while (DateTime.UtcNow < deadline)
+        {
+            using FeedIterator iterator = reader.GetChangeFeedStreamIterator(
+                ChangeFeedStartFrom.ContinuationToken(continuation), ChangeFeedMode.Incremental,
+                new ChangeFeedRequestOptions { PageSizeHint = 1 });
+            using ResponseMessage page = await iterator.ReadNextAsync(token);
+            if (page.StatusCode == HttpStatusCode.NotModified)
+            {
+                Require(!string.IsNullOrWhiteSpace(page.ContinuationToken), "Stream 304 change-feed page omitted continuation.");
+                continuation = page.ContinuationToken;
+                await Task.Delay(250, token);
+                continue;
+            }
+            page.EnsureSuccessStatusCode();
+            using JsonDocument envelope = await JsonDocument.ParseAsync(page.Content, cancellationToken: token);
+            JsonElement documents = envelope.RootElement.GetProperty("Documents");
+            if (documents.EnumerateArray().Any(document => document.GetProperty("id").GetString() == item.Id)) return;
+            Require(!string.IsNullOrWhiteSpace(page.ContinuationToken), "Stream change-feed page omitted continuation.");
+            continuation = page.ContinuationToken; // Only after the validated envelope was fully processed.
+        }
+        throw new SampleFailure("Stream latest-version change feed did not observe its run-owned item within 30 seconds.");
     }
 
     private static async Task ExpectTamperedReadsAsync(Container reader, OwnedItem item, CancellationToken token)
@@ -431,7 +611,7 @@ internal static class Program
 
     private static CosmosClientOptions ClientOptions(ConnectionMode mode) => new()
     {
-        ApplicationName = "ContentValidation-PR1-Sample", ConnectionMode = mode, ConsistencyLevel = ConsistencyLevel.Session,
+        ApplicationName = "ContentValidation-PR2-Sample", ConnectionMode = mode, ConsistencyLevel = ConsistencyLevel.Session,
         RequestTimeout = TimeSpan.FromSeconds(10), MaxRetryAttemptsOnRateLimitedRequests = 0,
         MaxRetryWaitTimeOnRateLimitedRequests = TimeSpan.Zero, LimitToEndpoint = true, EnableContentResponseOnWrite = true
     };
